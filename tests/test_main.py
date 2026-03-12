@@ -4,6 +4,16 @@ from app.main import app
 
 
 @pytest.mark.anyio
+async def test_frontend_is_served():
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/")
+    assert response.status_code == 200
+    assert "text/html" in response.headers["content-type"]
+    assert "Commercial Lighting" in response.text
+
+
+@pytest.mark.anyio
 async def test_get_files_returns_pdf_list():
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:

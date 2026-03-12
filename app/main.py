@@ -1,6 +1,7 @@
 import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 app = FastAPI(title="Commercial Lighting - Fixture Takeoff")
@@ -13,6 +14,16 @@ app.add_middleware(
 )
 
 INPUT_DIR = os.path.join(os.path.dirname(__file__), "..", "input-files")
+FRONTEND_DIR = os.path.join(os.path.dirname(__file__), "..", "frontend")
+
+
+@app.get("/")
+async def serve_frontend():
+    """Serve the frontend single-page app."""
+    return FileResponse(
+        os.path.join(FRONTEND_DIR, "index.html"),
+        media_type="text/html",
+    )
 
 
 @app.get("/files")
