@@ -55,10 +55,23 @@ def run_pipeline(pdf_path: str, output_dir: str = "data/output") -> dict:
     lighting_pages = page_map["lighting_plans"]
     schedule_pages = page_map["fixture_schedules"]
     unit_pages = page_map["unit_plans"]
+    other_pages = page_map["other"]
     logger.info(
-        "[Stage 2/5] Done in %.1fs — lighting=%d, schedule=%d, unit=%d pages",
-        time.time() - t0, len(lighting_pages), len(schedule_pages), len(unit_pages),
+        "[Stage 2/5] Done in %.1fs — lighting=%d, schedule=%d, unit=%d, other=%d pages",
+        time.time() - t0, len(lighting_pages), len(schedule_pages), len(unit_pages), len(other_pages),
     )
+    if lighting_pages:
+        logger.info("  Lighting plan pages (0-indexed): %s", lighting_pages)
+    if schedule_pages:
+        logger.info("  Fixture schedule pages (0-indexed): %s", schedule_pages)
+    if unit_pages:
+        logger.info("  Unit plan pages (0-indexed): %s", unit_pages)
+    # Log raw classifications for debugging
+    for item in page_map.get("raw_classifications", []):
+        cat = item.get("category", "?")
+        reason = item.get("reason", "")
+        if cat != "OTHER":
+            logger.info("  Page %d → %s (%s)", item.get("page", 0), cat, reason)
 
     if not lighting_pages:
         logger.warning("PIPELINE ABORT: No lighting plan pages found")
@@ -79,13 +92,20 @@ def run_pipeline(pdf_path: str, output_dir: str = "data/output") -> dict:
     logger.info("[Stage 3/5] Parsing fixture schedule...")
     t0 = time.time()
     if schedule_pages:
+        logger.info("  Parsing schedule from pages (0-indexed): %s", schedule_pages)
         schedule_result = parse_fixture_schedule(pdf_path, schedule_pages)
     else:
-        schedule_result = {"success": False, "fixture_types": [], "error": "No schedule pages found."}
+        logger.warning("  No schedule pages identified by LLM in Stage 2.")
+        logger.warning("  This can happen when the fixture schedule is rasterized (image-based) rather than text.")
+        logger.warning("  The LLM may not have classified any page as FIXTURE_SCHEDULE.")
+        schedule_result = {"success": False, "fixture_types": [], "error": "No schedule pages found. The LLM did not classify any page as FIXTURE_SCHEDULE. The schedule may be rasterized (image-based)."}
 
     if not schedule_result["success"]:
         logger.warning("[Stage 3/5] Failed in %.1fs — %s", time.time() - t0, schedule_result["error"])
         errors.append(schedule_result["error"])
+        logger.warning("PIPELINE ABORT at Stage 3: Cannot proceed without fixture types from schedule.")
+        logger.warning("  Lighting pages found: %s", lighting_pages)
+        logger.warning("  Schedule pages found: %s", schedule_pages)
         return {
             "status": "error",
             "fixture_counts": [],

@@ -67,19 +67,25 @@ def extract_page_full_text(pdf_path: str, page_index: int) -> str:
 
 
 def extract_all_page_titles(pdf_path: str) -> dict[int, str]:
-    """Extract short title text from every page in a single PDF open.
+    """Extract short title text from every page using fitz (PyMuPDF) for speed.
     Returns {page_index: title_text} for all pages.
+
+    Uses fitz instead of pdfplumber because title block text uses standard
+    TrueType fonts that fitz handles fine — the CID/Identity-H advantage of
+    pdfplumber only matters for fixture label counting, not page classification.
+    fitz is ~100x faster (~4s vs ~350s for 173 pages).
     """
     t0 = time.time()
     titles = {}
-    with pdfplumber.open(pdf_path) as pdf:
-        page_count = len(pdf.pages)
-        logger.info("Opened PDF (%d pages), extracting all titles in one pass...", page_count)
-        for i, page in enumerate(pdf.pages):
-            text = page.extract_text() or ""
-            titles[i] = text[:500].strip() if text else "(no text)"
-            if (i + 1) % 25 == 0 or i == page_count - 1:
-                logger.info("  Extracted %d/%d pages (%.1fs)", i + 1, page_count, time.time() - t0)
+    doc = fitz.open(pdf_path)
+    page_count = doc.page_count
+    logger.info("Opened PDF (%d pages), extracting all titles via fitz...", page_count)
+    for i in range(page_count):
+        text = doc[i].get_text()
+        titles[i] = text[:500].strip() if text else "(no text)"
+        if (i + 1) % 25 == 0 or i == page_count - 1:
+            logger.info("  Extracted %d/%d pages (%.1fs)", i + 1, page_count, time.time() - t0)
+    doc.close()
     return titles
 
 
