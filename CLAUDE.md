@@ -5,7 +5,7 @@ Automate the "lighting fixture takeoff" process for Commercial Lighting Industri
 
 **Current manual process**: Engineers receive architectural/electrical PDF drawings, manually read fixture schedules, count fixture symbols across all floor plan pages, and produce a Bill of Materials Excel file for quoting.
 
-**Goal**: Build a system that takes engineering drawing PDFs as input and produces a structured Excel file with fixture types, quantities, catalog numbers, and descriptions.
+**Goal**: Build a system that takes engineering drawing PDFs as input and produces a CSV with fixture Type + Quantity, using pdfplumber (deterministic) + LLM vision (verification).
 
 ## Business Context
 - **Company**: Commercial Lighting Industries (CLI), Indio, CA
@@ -13,14 +13,44 @@ Automate the "lighting fixture takeoff" process for Commercial Lighting Industri
 - **Client of**: Techjays (Philip Samuelraj) - building the POC
 - **Domain**: Commercial lighting distribution - they supply lighting fixtures for construction projects
 
-## Sample Data (3 difficulty levels)
-| Project | Difficulty | PDF Pages | PDF Size | Fixture Types |
-|---------|-----------|-----------|----------|---------------|
-| Popeyes (Newberg, OR) | Easy | 15 | 5.3 MB | ~14 types |
-| Chase Bank (Newport Beach) | Medium | 173 | 93 MB | ~30+ types |
-| AMLI BREA (Brea, CA) | Very Large | 135 | 157 MB | 80+ types |
+## Architecture
 
-## Key Files
+5-stage pipeline (see `docs/plans/2026-03-12-fixture-extractor-design.md` for full design):
+
+1. **Stage 1 — PDF Classifier** (`app/stages/classifier.py`): Checks if PDF is text-extractable (Bluebeam). Rejects non-extractable PDFs.
+2. **Stage 2 — Page Classifier** (`app/stages/page_classifier.py`): LLM classifies every page as LIGHTING_PLAN, FIXTURE_SCHEDULE, UNIT_PLAN, or OTHER.
+3. **Stage 3 — Schedule Parser** (`app/stages/schedule_parser.py`): Extracts fixture type codes from schedule pages using pdfplumber.
+4. **Stage 4 — Fixture Counter**:
+   - 4a. Deterministic (`app/stages/counter.py`): pdfplumber spatial extraction with exclusion zones (`app/utils/spatial.py`)
+   - 4b. LLM Vision (`app/stages/llm_counter.py`): Renders pages to images, LLM counts fixtures
+   - 4c. Reconciler (`app/stages/reconciler.py`): Compares 4a vs 4b, assigns confidence (high/review)
+5. **Stage 5 — Output** (`app/stages/reconciler.py`): Writes CSV with Type, Quantity, Confidence, Note
+
+Pipeline orchestrator: `app/pipeline.py`
+FastAPI endpoint: `app/main.py` — `POST /extract` (PDF upload), `GET /health`
+Frontend: `frontend/index.html` — Single-page UI for uploading PDFs and viewing results
+
+## Tech Stack
+- **Language**: Python 3.11+
+- **API Framework**: FastAPI + uvicorn
+- **PDF Text Extraction**: pdfplumber (best CID/Identity-H handling for Bluebeam PDFs)
+- **PDF Page Rendering**: PyMuPDF (fitz) — renders pages to images for LLM vision
+- **LLM SDKs**: anthropic, openai, google-generativeai — direct SDKs with thin wrapper (`app/utils/llm_client.py`)
+- **Config**: `.env` file (see `.env.example`) — API keys, model selection, thresholds
+- **Output**: CSV (Type, Quantity, Confidence)
+
+## Counting Patterns
+- **Direct Counting** (Chase Bank): Count fixture labels on lighting plan pages directly
+- **Unit Multiplication** (AMLI BREA): Count per unit type, multiply by unit instances (TODO: full implementation)
+
+## Sample Data (3 difficulty levels)
+| Project | Difficulty | PDF Pages | Fixture Types | Pattern |
+|---------|-----------|-----------|---------------|---------|
+| Popeyes (Newberg, OR) | Easy (out of scope v1) | 15 | ~14 types | Direct AutoCAD export — NOT extractable |
+| Chase Bank (Newport Beach) | Medium | 173 | ~30+ types | Direct counting |
+| AMLI BREA (Brea, CA) | Very Large | 135 | 80+ types | Unit multiplication |
+
+## Key Data Files
 - `Email.txt` - Original email from Kaz with project links and Popeyes counts
 - `AMLI-BREA, CA COUNTS.xlsx` - Expected output for AMLI BREA project
 - `CHASE BANK - NEWPORT BEACH COUNTS.xlsx` - Expected output for Chase Bank project
@@ -28,23 +58,68 @@ Automate the "lighting fixture takeoff" process for Commercial Lighting Industri
 - `04_Electrical_1-16-2026.pdf` - AMLI BREA electrical drawings
 - `20251119_JPMFC_Jamboree_SB_Revision to Permit_IFC_All Trades.pdf` - Chase Bank drawings
 
-## Output Excel Structure
-The output Excel file has a "Quote to Customer" sheet with columns:
-`Type | Quantity | CLI Catalog # | Ceiling Type | Ceiling Color | Manufacturer/Catalog # | Custom | Description`
+## Project Structure
+```
+app/
+  main.py                  # FastAPI app, POST /extract, GET /health
+  config.py                # Env vars, model config, thresholds
+  pipeline.py              # Orchestrates Stage 1-5
+  stages/
+    classifier.py          # Stage 1: PDF extractability check
+    page_classifier.py     # Stage 2: LLM page classification
+    schedule_parser.py     # Stage 3: Fixture schedule extraction
+    counter.py             # Stage 4a: pdfplumber spatial counting
+    llm_counter.py         # Stage 4b: LLM vision counting
+    reconciler.py          # Stage 4c: Compare, reconcile, CSV output
+  utils/
+    pdf_utils.py           # pdfplumber/fitz helpers
+    spatial.py             # Exclusion zone detection
+    llm_client.py          # Thin wrapper over provider SDKs
+frontend/
+  index.html               # Single-page UI
+tests/
+  test_classifier.py       # Stage 1 tests (3 tests)
+  test_page_classifier.py  # Stage 2 tests (requires LLM API key)
+  test_schedule_parser.py  # Stage 3 tests (3 tests)
+  test_counter.py          # Stage 4a tests (2 tests)
+  test_llm_counter.py      # Stage 4b tests (3 deterministic + 1 LLM)
+  test_reconciler.py       # Stage 4c tests (4 tests)
+  test_pdf_utils.py        # PDF utility tests (7 tests)
+  test_llm_client.py       # LLM client tests (requires API key)
+  test_main.py             # FastAPI endpoint tests (2 tests)
+  test_pipeline.py         # Pipeline integration test (requires API key)
+  test_e2e_validation.py   # E2E comparison against expected Excel counts
+docs/
+  plans/                   # Design and implementation plans
+  pdf-encoding-analysis.md # PDF encoding analysis across 3 samples
+  popeyes-counts-derivation.md
+  how-counts-are-derived.md
+```
 
-There is also an "Import" sheet used for internal system integration with columns:
-`DocID | Customer Number | Item Number | QTY | Price | LineType | Sector | Jobname | Custom | RowNumber | WorkSheetName`
+## Running
 
-## Engineering Drawing Structure
-1. **Cover/Index pages** - project info, sheet index
-2. **General notes pages** - electrical specs, code references
-3. **Lighting Fixture Schedule page(s)** - TABLE listing each fixture type with: Type code, Manufacturer, Catalog #, Lamp info, Wattage, Voltage, Remarks
-4. **Floor plan pages** - CAD drawings with fixture symbols placed on the plan, labeled with type codes (e.g., "AL1", "GA", "D1A")
-5. **Panel schedules, single-line diagrams** - electrical distribution info
+```bash
+# Install dependencies
+pip install -r requirements.txt
+
+# Set up API keys
+cp .env.example .env
+# Edit .env with your API key
+
+# Run tests (deterministic only — no API key needed)
+pytest tests/test_classifier.py tests/test_schedule_parser.py tests/test_counter.py tests/test_reconciler.py tests/test_llm_counter.py tests/test_main.py -v
+
+# Run the server
+uvicorn app.main:app --reload --port 8000
+
+# Extract fixtures from a PDF
+curl -X POST "http://localhost:8000/extract" -F "file=@your-drawing.pdf"
+```
 
 ## Technical Notes
-- PDFs are CAD-generated (AutoCAD .dwg exported to PDF), so they contain a mix of extractable text and graphical elements
-- Fixture symbols on floor plans are graphical - they need visual/spatial recognition to count
-- The Lighting Fixture Schedule pages contain structured text that can be extracted with PyMuPDF
-- Large PDFs (100MB+) cannot be read by the built-in PDF reader tool
-- Python packages available: `openpyxl`, `pymupdf` (fitz)
+- Only Bluebeam-exported PDFs are supported in v1 (direct AutoCAD exports have SHX vector strokes, not extractable text)
+- pdfplumber finds ~2.5x more fixture labels than PyMuPDF due to better CID/Identity-H handling
+- LLM is verification only — never the sole source of truth
+- Rasterized fixture schedules are rejected (not OCR'd) with a clear error message
+- Classifier threshold set to 2000 avg chars to correctly reject Popeyes (has title block text but no fixture labels)
+- Schedule parser currently extracts ~440 candidates from AMLI (noisy) — needs refinement

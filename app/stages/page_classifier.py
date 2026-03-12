@@ -1,7 +1,11 @@
 import json
+import logging
 import re
-from app.utils.pdf_utils import extract_page_full_text, get_page_count
+import time
+from app.utils.pdf_utils import extract_page_full_text, get_page_count, extract_all_page_titles
 from app.utils.llm_client import llm_text_query
+
+logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """You are an expert at reading engineering drawing sheet indexes.
 You classify pages from electrical engineering PDF drawings.
@@ -26,13 +30,9 @@ Important:
 def extract_sheet_titles(pdf_path: str) -> dict[int, str]:
     """Extract a short title/description from each page.
     Returns {page_index: title_text} for all pages.
+    Uses single PDF open for speed.
     """
-    page_count = get_page_count(pdf_path)
-    titles = {}
-    for i in range(page_count):
-        text = extract_page_full_text(pdf_path, i)
-        titles[i] = text[:500].strip() if text else "(no text)"
-    return titles
+    return extract_all_page_titles(pdf_path)
 
 
 def classify_pages(pdf_path: str) -> dict:
@@ -46,7 +46,9 @@ def classify_pages(pdf_path: str) -> dict:
             "raw_classifications": [{page, category, reason}, ...]
         }
     """
+    t0 = time.time()
     titles = extract_sheet_titles(pdf_path)
+    logger.info("Title extraction complete (%.1fs)", time.time() - t0)
 
     lines = []
     for idx, title in sorted(titles.items()):
@@ -54,10 +56,13 @@ def classify_pages(pdf_path: str) -> dict:
         lines.append(f"Page {idx + 1}: {short_title}")
 
     prompt = "Classify each page:\n\n" + "\n".join(lines)
-
+    logger.info("Sending %d page titles to LLM for classification...", len(lines))
+    t0 = time.time()
     response = llm_text_query(SYSTEM_PROMPT, prompt)
+    logger.info("LLM classification response received (%.1fs)", time.time() - t0)
 
     classifications = _parse_llm_response(response)
+    logger.info("Parsed %d page classifications", len(classifications))
 
     result = {
         "lighting_plans": [],

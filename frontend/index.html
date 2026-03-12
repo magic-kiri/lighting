@@ -392,7 +392,9 @@
     </div>
 
     <script>
-        const API_BASE = window.location.origin;
+        const API_BASE = window.location.protocol === 'file:'
+            ? 'http://localhost:8000'
+            : window.location.origin;
         const select = document.getElementById('pdf-select');
         const extractBtn = document.getElementById('extract-btn');
         const loader = document.getElementById('loader');
