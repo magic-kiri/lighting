@@ -6,3 +6,5 @@ data/output/*.csv
 *.xlsx
 *.pdf
 .venv/
+
+.claude/settings.local.json
