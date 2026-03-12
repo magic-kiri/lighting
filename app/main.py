@@ -1,75 +1,37 @@
 import os
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
-from pydantic import BaseModel
+import tempfile
+import shutil
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import JSONResponse
+from app.pipeline import run_pipeline
 
-app = FastAPI(title="Commercial Lighting - Fixture Takeoff")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+app = FastAPI(
+    title="Fixture Extractor",
+    description="Extract lighting fixture counts from engineering drawing PDFs",
+    version="0.1.0",
 )
-
-INPUT_DIR = os.path.join(os.path.dirname(__file__), "..", "input-files")
-FRONTEND_DIR = os.path.join(os.path.dirname(__file__), "..", "frontend")
-
-
-@app.get("/")
-async def serve_frontend():
-    """Serve the frontend single-page app."""
-    return FileResponse(
-        os.path.join(FRONTEND_DIR, "index.html"),
-        media_type="text/html",
-    )
-
-
-@app.get("/files")
-async def list_files():
-    """List all PDF files available in the input-files directory."""
-    files = []
-    if os.path.isdir(INPUT_DIR):
-        files = sorted(
-            f for f in os.listdir(INPUT_DIR)
-            if f.lower().endswith(".pdf")
-        )
-    return {"files": files}
-
-
-class ExtractRequest(BaseModel):
-    file_path: str
 
 
 @app.post("/extract")
-async def extract_counts(request: ExtractRequest):
-    """Extract fixture counts from a PDF file.
-    Currently a stub — returns mock data structure.
-    The backend agent will implement the real pipeline.
-    """
-    full_path = os.path.join(INPUT_DIR, request.file_path)
+async def extract_fixtures(file: UploadFile = File(...)):
+    """Upload a PDF and extract fixture counts."""
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are accepted.")
 
-    if not os.path.isfile(full_path):
-        return {
-            "status": "error",
-            "error": f"File not found: {request.file_path}",
-            "fixture_counts": [],
-            "csv_path": None,
-        }
+    # Save uploaded file to temp location
+    tmp_dir = tempfile.mkdtemp()
+    tmp_path = os.path.join(tmp_dir, file.filename)
+    try:
+        with open(tmp_path, "wb") as f:
+            content = await file.read()
+            f.write(content)
 
-    # Stub response — backend agent will replace with real pipeline
-    return {
-        "status": "success",
-        "project_name": os.path.splitext(request.file_path)[0],
-        "pattern": "direct_counting",
-        "fixture_counts": [],
-        "csv_path": None,
-        "pages_analyzed": {
-            "lighting_plans": [],
-            "fixture_schedule": [],
-            "unit_plans": [],
-        },
-        "schedule_types_found": 0,
-        "errors": [],
-    }
+        result = run_pipeline(tmp_path, output_dir="data/output")
+        return JSONResponse(content=result)
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
