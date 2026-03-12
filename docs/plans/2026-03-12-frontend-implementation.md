@@ -1,0 +1,878 @@
+# Frontend Implementation Plan
+
+> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
+
+**Goal:** Build a single-page demo UI that lets users select a PDF from `input-files/`, trigger extraction via the backend API, and view results with aesthetic loading animations.
+
+**Architecture:** Single `frontend/index.html` file with embedded CSS and JS. FastAPI serves it as a static file alongside the existing backend. Two new API endpoints: `GET /files` to list available PDFs, and `POST /extract` accepts `{"file_path": "..."}`. The frontend uses `fetch()` to call these endpoints.
+
+**Tech Stack:** Vanilla HTML, CSS (custom properties, keyframe animations), JavaScript (ES6+, fetch API). FastAPI for serving. No external dependencies.
+
+---
+
+### Task 1: Create FastAPI Main App with GET /files Endpoint
+
+**Files:**
+- Create: `app/main.py`
+- Test: `tests/test_main.py`
+
+**Step 1: Write the failing test**
+
+```python
+# tests/test_main.py
+import pytest
+from httpx import AsyncClient, ASGITransport
+from app.main import app
+
+
+@pytest.mark.anyio
+async def test_get_files_returns_pdf_list():
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/files")
+    assert response.status_code == 200
+    data = response.json()
+    assert "files" in data
+    assert isinstance(data["files"], list)
+
+
+@pytest.mark.anyio
+async def test_get_files_only_returns_pdfs():
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/files")
+    data = response.json()
+    for f in data["files"]:
+        assert f.lower().endswith(".pdf")
+```
+
+**Step 2: Run test to verify it fails**
+
+Run: `pytest tests/test_main.py -v`
+Expected: FAIL with `ModuleNotFoundError` or `ImportError` (app.main doesn't exist)
+
+**Step 3: Install anyio test dependency**
+
+Run: `pip install anyio pytest-anyio` (needed for async tests with httpx)
+
+**Step 4: Write minimal implementation**
+
+```python
+# app/main.py
+import os
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+app = FastAPI(title="Commercial Lighting - Fixture Takeoff")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+INPUT_DIR = os.path.join(os.path.dirname(__file__), "..", "input-files")
+
+
+@app.get("/files")
+async def list_files():
+    """List all PDF files available in the input-files directory."""
+    files = []
+    if os.path.isdir(INPUT_DIR):
+        files = sorted(
+            f for f in os.listdir(INPUT_DIR)
+            if f.lower().endswith(".pdf")
+        )
+    return {"files": files}
+```
+
+**Step 5: Run test to verify it passes**
+
+Run: `pytest tests/test_main.py -v`
+Expected: PASS
+
+**Step 6: Commit**
+
+```bash
+git add app/main.py tests/test_main.py
+git commit -m "feat: add FastAPI app with GET /files endpoint"
+```
+
+---
+
+### Task 2: Add POST /extract Endpoint Stub
+
+**Files:**
+- Modify: `app/main.py`
+- Test: `tests/test_main.py`
+
+**Step 1: Write the failing test**
+
+Add to `tests/test_main.py`:
+
+```python
+@pytest.mark.anyio
+async def test_extract_requires_file_path():
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post("/extract", json={})
+    assert response.status_code == 422
+
+
+@pytest.mark.anyio
+async def test_extract_rejects_missing_file():
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post("/extract", json={"file_path": "nonexistent.pdf"})
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "error"
+    assert "not found" in data["error"].lower()
+
+
+@pytest.mark.anyio
+async def test_extract_accepts_valid_file():
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        # First get a real file
+        files_resp = await client.get("/files")
+        files = files_resp.json()["files"]
+        if not files:
+            pytest.skip("No PDF files in input-files/")
+
+        response = await client.post("/extract", json={"file_path": files[0]})
+    assert response.status_code == 200
+    data = response.json()
+    # Stub returns success with empty counts
+    assert data["status"] in ("success", "error")
+```
+
+**Step 2: Run test to verify it fails**
+
+Run: `pytest tests/test_main.py::test_extract_requires_file_path -v`
+Expected: FAIL (no /extract route)
+
+**Step 3: Write minimal implementation**
+
+Add to `app/main.py`:
+
+```python
+from pydantic import BaseModel
+
+
+class ExtractRequest(BaseModel):
+    file_path: str
+
+
+@app.post("/extract")
+async def extract_counts(request: ExtractRequest):
+    """Extract fixture counts from a PDF file.
+
+    Currently a stub — returns mock data structure.
+    The backend agent will implement the real pipeline.
+    """
+    full_path = os.path.join(INPUT_DIR, request.file_path)
+
+    if not os.path.isfile(full_path):
+        return {
+            "status": "error",
+            "error": f"File not found: {request.file_path}",
+            "fixture_counts": [],
+            "csv_path": None,
+        }
+
+    # Stub response — backend agent will replace with real pipeline
+    return {
+        "status": "success",
+        "project_name": os.path.splitext(request.file_path)[0],
+        "pattern": "direct_counting",
+        "fixture_counts": [],
+        "csv_path": None,
+        "pages_analyzed": {
+            "lighting_plans": [],
+            "fixture_schedule": [],
+            "unit_plans": [],
+        },
+        "schedule_types_found": 0,
+        "errors": [],
+    }
+```
+
+**Step 4: Run tests to verify they pass**
+
+Run: `pytest tests/test_main.py -v`
+Expected: ALL PASS
+
+**Step 5: Commit**
+
+```bash
+git add app/main.py tests/test_main.py
+git commit -m "feat: add POST /extract endpoint stub"
+```
+
+---
+
+### Task 3: Create the Frontend HTML/CSS/JS File
+
+**Files:**
+- Create: `frontend/index.html`
+
+**Step 1: Create the frontend directory**
+
+Run: `mkdir -p frontend`
+
+**Step 2: Write the complete frontend file**
+
+Create `frontend/index.html` with the full single-page app:
+
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Commercial Lighting - Fixture Takeoff</title>
+    <style>
+        :root {
+            --bg: #f8fafc;
+            --card-bg: #ffffff;
+            --text: #1e293b;
+            --text-muted: #64748b;
+            --border: #e2e8f0;
+            --primary: #3b82f6;
+            --primary-hover: #2563eb;
+            --success: #22c55e;
+            --warning: #f59e0b;
+            --error: #ef4444;
+            --error-bg: #fef2f2;
+            --error-border: #fecaca;
+            --shimmer-base: #e2e8f0;
+            --shimmer-highlight: #f1f5f9;
+            --radius: 12px;
+            --shadow: 0 1px 3px rgba(0,0,0,0.08), 0 4px 12px rgba(0,0,0,0.04);
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 40px 20px;
+        }
+
+        .container {
+            width: 100%;
+            max-width: 720px;
+        }
+
+        header {
+            text-align: center;
+            margin-bottom: 32px;
+        }
+
+        header h1 {
+            font-size: 1.5rem;
+            font-weight: 700;
+            color: var(--text);
+            letter-spacing: -0.02em;
+        }
+
+        header p {
+            font-size: 0.875rem;
+            color: var(--text-muted);
+            margin-top: 4px;
+        }
+
+        .card {
+            background: var(--card-bg);
+            border-radius: var(--radius);
+            box-shadow: var(--shadow);
+            border: 1px solid var(--border);
+            padding: 24px;
+            margin-bottom: 20px;
+        }
+
+        .form-group {
+            margin-bottom: 16px;
+        }
+
+        .form-group label {
+            display: block;
+            font-size: 0.875rem;
+            font-weight: 600;
+            color: var(--text);
+            margin-bottom: 6px;
+        }
+
+        select {
+            width: 100%;
+            padding: 10px 14px;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            font-size: 0.9rem;
+            color: var(--text);
+            background: var(--card-bg);
+            cursor: pointer;
+            appearance: none;
+            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%2364748b' stroke-width='2'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+            background-repeat: no-repeat;
+            background-position: right 12px center;
+        }
+
+        select:focus {
+            outline: none;
+            border-color: var(--primary);
+            box-shadow: 0 0 0 3px rgba(59,130,246,0.15);
+        }
+
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 10px 20px;
+            border: none;
+            border-radius: 8px;
+            font-size: 0.9rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.15s ease;
+        }
+
+        .btn-primary {
+            background: var(--primary);
+            color: white;
+        }
+
+        .btn-primary:hover:not(:disabled) {
+            background: var(--primary-hover);
+            transform: translateY(-1px);
+            box-shadow: 0 4px 12px rgba(59,130,246,0.3);
+        }
+
+        .btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        /* Loading skeleton */
+        .loader { display: none; }
+        .loader.active { display: block; }
+
+        .loader-header {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 20px;
+        }
+
+        .spinner {
+            width: 20px;
+            height: 20px;
+            border: 2.5px solid var(--border);
+            border-top-color: var(--primary);
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        .loader-text {
+            font-size: 0.875rem;
+            color: var(--text-muted);
+            font-weight: 500;
+        }
+
+        .skeleton-rows {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+
+        .skeleton-row {
+            display: flex;
+            gap: 16px;
+            align-items: center;
+        }
+
+        .skeleton-bar {
+            height: 16px;
+            border-radius: 4px;
+            background: linear-gradient(
+                90deg,
+                var(--shimmer-base) 25%,
+                var(--shimmer-highlight) 50%,
+                var(--shimmer-base) 75%
+            );
+            background-size: 200% 100%;
+            animation: shimmer 1.5s ease-in-out infinite;
+        }
+
+        @keyframes shimmer {
+            0% { background-position: 200% 0; }
+            100% { background-position: -200% 0; }
+        }
+
+        .skeleton-bar.w-sm { width: 48px; }
+        .skeleton-bar.w-md { width: 80px; }
+        .skeleton-bar.w-lg { width: 160px; }
+        .skeleton-bar.w-xl { width: 100%; }
+
+        .pulse-dot {
+            display: inline-block;
+            animation: pulse 1.5s ease-in-out infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 0.4; }
+            50% { opacity: 1; }
+        }
+
+        /* Error */
+        .error-box {
+            display: none;
+            background: var(--error-bg);
+            border: 1px solid var(--error-border);
+            border-radius: 8px;
+            padding: 14px 16px;
+            color: var(--error);
+            font-size: 0.875rem;
+            line-height: 1.5;
+        }
+
+        .error-box.active { display: block; }
+
+        .error-box strong {
+            display: block;
+            margin-bottom: 4px;
+        }
+
+        /* Results */
+        .results { display: none; }
+        .results.active { display: block; }
+
+        .results-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.875rem;
+        }
+
+        .results-table th {
+            text-align: left;
+            font-weight: 600;
+            color: var(--text-muted);
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            padding: 8px 12px;
+            border-bottom: 2px solid var(--border);
+        }
+
+        .results-table td {
+            padding: 10px 12px;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .results-table tr:last-child td {
+            border-bottom: none;
+        }
+
+        .results-table tr:hover td {
+            background: var(--bg);
+        }
+
+        .badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            padding: 2px 8px;
+            border-radius: 12px;
+            font-size: 0.75rem;
+            font-weight: 600;
+        }
+
+        .badge-high {
+            background: #f0fdf4;
+            color: #16a34a;
+        }
+
+        .badge-review {
+            background: #fffbeb;
+            color: #d97706;
+        }
+
+        .badge-dot {
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+        }
+
+        .badge-high .badge-dot { background: var(--success); }
+        .badge-review .badge-dot { background: var(--warning); }
+
+        .meta {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 16px;
+            margin-top: 16px;
+            padding-top: 16px;
+            border-top: 1px solid var(--border);
+            font-size: 0.8rem;
+            color: var(--text-muted);
+        }
+
+        .meta-item strong {
+            color: var(--text);
+        }
+
+        .qty-cell {
+            font-variant-numeric: tabular-nums;
+            font-weight: 600;
+        }
+
+        .note-cell {
+            font-size: 0.8rem;
+            color: var(--text-muted);
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Commercial Lighting</h1>
+            <p>Fixture Takeoff Automation</p>
+        </header>
+
+        <div class="card">
+            <div class="form-group">
+                <label for="pdf-select">Select PDF Drawing</label>
+                <select id="pdf-select">
+                    <option value="">Loading files...</option>
+                </select>
+            </div>
+            <button class="btn btn-primary" id="extract-btn" disabled>
+                Extract Counts
+            </button>
+        </div>
+
+        <div class="card loader" id="loader">
+            <div class="loader-header">
+                <div class="spinner"></div>
+                <span class="loader-text">
+                    Analyzing pages<span class="pulse-dot">...</span>
+                </span>
+            </div>
+            <div class="skeleton-rows">
+                <div class="skeleton-row">
+                    <div class="skeleton-bar w-sm" style="animation-delay: 0s"></div>
+                    <div class="skeleton-bar w-md" style="animation-delay: 0.1s"></div>
+                    <div class="skeleton-bar w-lg" style="animation-delay: 0.2s"></div>
+                </div>
+                <div class="skeleton-row">
+                    <div class="skeleton-bar w-sm" style="animation-delay: 0.15s"></div>
+                    <div class="skeleton-bar w-md" style="animation-delay: 0.25s"></div>
+                    <div class="skeleton-bar w-xl" style="animation-delay: 0.35s"></div>
+                </div>
+                <div class="skeleton-row">
+                    <div class="skeleton-bar w-sm" style="animation-delay: 0.3s"></div>
+                    <div class="skeleton-bar w-md" style="animation-delay: 0.4s"></div>
+                    <div class="skeleton-bar w-lg" style="animation-delay: 0.5s"></div>
+                </div>
+                <div class="skeleton-row">
+                    <div class="skeleton-bar w-sm" style="animation-delay: 0.45s"></div>
+                    <div class="skeleton-bar w-md" style="animation-delay: 0.55s"></div>
+                    <div class="skeleton-bar w-lg" style="animation-delay: 0.65s"></div>
+                </div>
+                <div class="skeleton-row">
+                    <div class="skeleton-bar w-sm" style="animation-delay: 0.6s"></div>
+                    <div class="skeleton-bar w-md" style="animation-delay: 0.7s"></div>
+                    <div class="skeleton-bar w-xl" style="animation-delay: 0.8s"></div>
+                </div>
+            </div>
+        </div>
+
+        <div class="card error-box" id="error-box">
+            <strong>Extraction Error</strong>
+            <span id="error-message"></span>
+        </div>
+
+        <div class="card results" id="results">
+            <table class="results-table">
+                <thead>
+                    <tr>
+                        <th>Type</th>
+                        <th>Qty</th>
+                        <th>Confidence</th>
+                        <th>Notes</th>
+                    </tr>
+                </thead>
+                <tbody id="results-body"></tbody>
+            </table>
+            <div class="meta" id="results-meta"></div>
+        </div>
+    </div>
+
+    <script>
+        const API_BASE = window.location.origin;
+        const select = document.getElementById('pdf-select');
+        const extractBtn = document.getElementById('extract-btn');
+        const loader = document.getElementById('loader');
+        const errorBox = document.getElementById('error-box');
+        const errorMessage = document.getElementById('error-message');
+        const results = document.getElementById('results');
+        const resultsBody = document.getElementById('results-body');
+        const resultsMeta = document.getElementById('results-meta');
+
+        // Load file list on page load
+        async function loadFiles() {
+            try {
+                const resp = await fetch(`${API_BASE}/files`);
+                const data = await resp.json();
+                select.innerHTML = '';
+
+                if (data.files.length === 0) {
+                    select.innerHTML = '<option value="">No PDF files found</option>';
+                    return;
+                }
+
+                select.innerHTML = '<option value="">-- Select a PDF --</option>';
+                data.files.forEach(f => {
+                    const opt = document.createElement('option');
+                    opt.value = f;
+                    opt.textContent = f;
+                    select.appendChild(opt);
+                });
+                extractBtn.disabled = true;
+            } catch (err) {
+                select.innerHTML = '<option value="">Failed to load files</option>';
+                console.error('Failed to load files:', err);
+            }
+        }
+
+        select.addEventListener('change', () => {
+            extractBtn.disabled = !select.value;
+            // Clear previous results when selection changes
+            hideAll();
+        });
+
+        extractBtn.addEventListener('click', async () => {
+            if (!select.value) return;
+
+            // Reset UI
+            hideAll();
+            loader.classList.add('active');
+            extractBtn.disabled = true;
+
+            try {
+                const resp = await fetch(`${API_BASE}/extract`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ file_path: select.value }),
+                });
+
+                const data = await resp.json();
+                loader.classList.remove('active');
+
+                if (data.status === 'error') {
+                    showError(data.error);
+                } else {
+                    showResults(data);
+                }
+            } catch (err) {
+                loader.classList.remove('active');
+                showError(`Network error: ${err.message}`);
+            } finally {
+                extractBtn.disabled = !select.value;
+            }
+        });
+
+        function hideAll() {
+            loader.classList.remove('active');
+            errorBox.classList.remove('active');
+            results.classList.remove('active');
+        }
+
+        function showError(msg) {
+            errorMessage.textContent = msg;
+            errorBox.classList.add('active');
+        }
+
+        function showResults(data) {
+            resultsBody.innerHTML = '';
+
+            if (data.fixture_counts.length === 0) {
+                resultsBody.innerHTML = `
+                    <tr>
+                        <td colspan="4" style="text-align:center; color:var(--text-muted); padding:24px;">
+                            No fixtures found in this PDF.
+                        </td>
+                    </tr>`;
+            } else {
+                data.fixture_counts.forEach(fc => {
+                    const badgeClass = fc.confidence === 'high' ? 'badge-high' : 'badge-review';
+                    const row = document.createElement('tr');
+                    row.innerHTML = `
+                        <td><strong>${fc.type}</strong></td>
+                        <td class="qty-cell">${fc.quantity}</td>
+                        <td>
+                            <span class="badge ${badgeClass}">
+                                <span class="badge-dot"></span>
+                                ${fc.confidence}
+                            </span>
+                        </td>
+                        <td class="note-cell">${fc.note || ''}</td>`;
+                    resultsBody.appendChild(row);
+                });
+            }
+
+            // Build metadata
+            const metaParts = [];
+            if (data.project_name) {
+                metaParts.push(`<span class="meta-item"><strong>Project:</strong> ${data.project_name}</span>`);
+            }
+            if (data.pattern) {
+                metaParts.push(`<span class="meta-item"><strong>Pattern:</strong> ${data.pattern}</span>`);
+            }
+            if (data.schedule_types_found) {
+                metaParts.push(`<span class="meta-item"><strong>Schedule types:</strong> ${data.schedule_types_found}</span>`);
+            }
+            if (data.pages_analyzed) {
+                const lp = data.pages_analyzed.lighting_plans || [];
+                if (lp.length) {
+                    metaParts.push(`<span class="meta-item"><strong>Plan pages:</strong> ${lp.join(', ')}</span>`);
+                }
+            }
+            resultsMeta.innerHTML = metaParts.join('');
+
+            results.classList.add('active');
+        }
+
+        // Init
+        loadFiles();
+    </script>
+</body>
+</html>
+```
+
+**Step 3: Verify the file was created**
+
+Run: `ls frontend/index.html`
+Expected: File exists
+
+**Step 4: Commit**
+
+```bash
+git add frontend/index.html
+git commit -m "feat: add frontend single-page UI with loader and results table"
+```
+
+---
+
+### Task 4: Serve Frontend from FastAPI
+
+**Files:**
+- Modify: `app/main.py`
+
+**Step 1: Write the failing test**
+
+Add to `tests/test_main.py`:
+
+```python
+@pytest.mark.anyio
+async def test_frontend_is_served():
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/")
+    assert response.status_code == 200
+    assert "text/html" in response.headers["content-type"]
+    assert "Commercial Lighting" in response.text
+```
+
+**Step 2: Run test to verify it fails**
+
+Run: `pytest tests/test_main.py::test_frontend_is_served -v`
+Expected: FAIL (no route for /)
+
+**Step 3: Add static file serving to main.py**
+
+Add to `app/main.py`:
+
+```python
+from fastapi.responses import FileResponse
+
+FRONTEND_DIR = os.path.join(os.path.dirname(__file__), "..", "frontend")
+
+
+@app.get("/")
+async def serve_frontend():
+    """Serve the frontend single-page app."""
+    return FileResponse(
+        os.path.join(FRONTEND_DIR, "index.html"),
+        media_type="text/html",
+    )
+```
+
+**Step 4: Run all tests**
+
+Run: `pytest tests/test_main.py -v`
+Expected: ALL PASS
+
+**Step 5: Commit**
+
+```bash
+git add app/main.py tests/test_main.py
+git commit -m "feat: serve frontend index.html from FastAPI root route"
+```
+
+---
+
+### Task 5: Manual Integration Test
+
+**Files:** None (verification only)
+
+**Step 1: Start the server**
+
+Run: `cd "E:/Code/Commercial Lighting" && uvicorn app.main:app --reload --port 8000`
+
+**Step 2: Verify in browser**
+
+Open `http://localhost:8000` and verify:
+- Page loads with "Commercial Lighting" header
+- Dropdown shows the 3 PDF files
+- Selecting a PDF enables the "Extract Counts" button
+- Clicking "Extract Counts" shows the loading animation
+- Loading finishes and shows the stub result (empty fixture list)
+- The "No fixtures found" message appears cleanly
+
+**Step 3: Test error state**
+
+Manually test by modifying the API temporarily or checking that network errors display properly.
+
+**Step 4: Commit any fixes if needed**
+
+```bash
+git add -A
+git commit -m "fix: integration test fixes"
+```
+
+---
+
+## Summary
+
+| Task | What | Files |
+|------|------|-------|
+| 1 | FastAPI app + GET /files | `app/main.py`, `tests/test_main.py` |
+| 2 | POST /extract stub | `app/main.py`, `tests/test_main.py` |
+| 3 | Frontend HTML/CSS/JS | `frontend/index.html` |
+| 4 | Serve frontend from FastAPI | `app/main.py`, `tests/test_main.py` |
+| 5 | Manual integration test | — |
+
+The backend agent can later replace the `/extract` stub with the real 5-stage pipeline. The frontend will work unchanged since it consumes the same JSON response format.
