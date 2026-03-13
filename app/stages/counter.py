@@ -5,6 +5,11 @@ from app.utils.spatial import identify_title_block_region, identify_legend_regio
 import pdfplumber
 
 
+def normalize_fixture_code(code: str) -> str:
+    """Normalize fixture codes: DF01→DF1, DF03→DF3, etc."""
+    return re.sub(r'^(DF)0+(\d)', r'\1\2', code)
+
+
 def count_fixtures_on_page(pdf_path: str, page_index: int, fixture_types: list[str]) -> dict[str, int]:
     """Count fixture labels on a single page using spatial filtering."""
     with pdfplumber.open(pdf_path) as pdf:
@@ -18,7 +23,8 @@ def count_fixtures_on_page(pdf_path: str, page_index: int, fixture_types: list[s
     legend_regions = identify_legend_regions(words, page_width, page_height)
     exclusion_zones = [title_block] + legend_regions
 
-    type_set = {t.upper().strip() for t in fixture_types}
+    # Normalize type codes and build lookup
+    type_set = {normalize_fixture_code(t.upper().strip()) for t in fixture_types}
     type_patterns = {}
     for t in type_set:
         escaped = re.escape(t)
@@ -27,7 +33,7 @@ def count_fixtures_on_page(pdf_path: str, page_index: int, fixture_types: list[s
     counts = Counter()
 
     for word in words:
-        text = word["text"].strip().upper()
+        text = normalize_fixture_code(word["text"].strip().upper())
         x0, y0 = word["x0"], word["y0"]
 
         in_exclusion = False

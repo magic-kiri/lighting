@@ -2,15 +2,32 @@ import logging
 import os
 import re
 import time
+from collections import Counter
 from app.stages.classifier import classify_pdf
-from app.stages.page_classifier import classify_pages
+from app.stages.page_classifier import classify_pages, detect_lighting_pages
 from app.stages.schedule_parser import parse_fixture_schedule
-from app.stages.counter import count_fixtures_multi_page
+from app.stages.counter import count_fixtures_multi_page, normalize_fixture_code
 from app.stages.llm_counter import count_fixtures_with_llm_multi_page
 from app.stages.reconciler import reconcile_counts, write_csv
 from app.config import CONFIDENCE_THRESHOLD
+from app.utils.pdf_utils import extract_page_words
 
 logger = logging.getLogger(__name__)
+
+# Pattern for discovering fixture type codes from floor plan pages.
+# Uses known lighting fixture prefixes to avoid false positives from
+# sheet numbers (E-211), sensors (OS3), cables (CAT6E), etc.
+_FIXTURE_TYPE_RE = re.compile(
+    r'^('
+    r'D\d+[A-Z]?'       # D1A, D1B, D2 (downlights)
+    r'|L\d+[A-Z]?'      # L1A, L2A, L5, L6 (linear)
+    r'|L-\d+'           # L-8, L-22 (linear with dash)
+    r'|DF\d+'           # DF01, DF3 (decorative fixtures)
+    r'|X\d+'            # X1 (exit signs)
+    r'|B\d+[A-Z]?'     # B1, B2, B5
+    r'|U\d+[A-Z]?'     # U1, U2
+    r')(-EM)?$'
+)
 
 
 def run_pipeline(pdf_path: str, output_dir: str = "data/output") -> dict:
@@ -48,30 +65,40 @@ def run_pipeline(pdf_path: str, output_dir: str = "data/output") -> dict:
             "errors": [classification["error"]],
         }
 
-    # --- Stage 2: Page Classification ---
-    logger.info("[Stage 2/5] Classifying pages (LLM)...")
+    # --- Stage 2: Page Detection ---
+    # Try deterministic detection first (fast, no LLM API call)
+    logger.info("[Stage 2/5] Detecting lighting pages...")
     t0 = time.time()
-    page_map = classify_pages(pdf_path)
-    lighting_pages = page_map["lighting_plans"]
-    schedule_pages = page_map["fixture_schedules"]
-    unit_pages = page_map["unit_plans"]
-    other_pages = page_map["other"]
-    logger.info(
-        "[Stage 2/5] Done in %.1fs — lighting=%d, schedule=%d, unit=%d, other=%d pages",
-        time.time() - t0, len(lighting_pages), len(schedule_pages), len(unit_pages), len(other_pages),
-    )
+    lighting_pages = detect_lighting_pages(pdf_path)
+    schedule_pages = []
+    unit_pages = []
+
     if lighting_pages:
-        logger.info("  Lighting plan pages (0-indexed): %s", lighting_pages)
-    if schedule_pages:
-        logger.info("  Fixture schedule pages (0-indexed): %s", schedule_pages)
-    if unit_pages:
-        logger.info("  Unit plan pages (0-indexed): %s", unit_pages)
-    # Log raw classifications for debugging
-    for item in page_map.get("raw_classifications", []):
-        cat = item.get("category", "?")
-        reason = item.get("reason", "")
-        if cat != "OTHER":
-            logger.info("  Page %d → %s (%s)", item.get("page", 0), cat, reason)
+        logger.info(
+            "[Stage 2/5] Deterministic detection done in %.1fs — %d lighting pages: %s",
+            time.time() - t0, len(lighting_pages), lighting_pages,
+        )
+    else:
+        # Fallback: LLM classification
+        logger.info("[Stage 2/5] No pages found deterministically, falling back to LLM classification...")
+        t0 = time.time()
+        page_map = classify_pages(pdf_path)
+        lighting_pages = page_map["lighting_plans"]
+        schedule_pages = page_map["fixture_schedules"]
+        unit_pages = page_map["unit_plans"]
+        other_pages = page_map["other"]
+        logger.info(
+            "[Stage 2/5] LLM done in %.1fs — lighting=%d, schedule=%d, unit=%d, other=%d pages",
+            time.time() - t0, len(lighting_pages), len(schedule_pages), len(unit_pages), len(other_pages),
+        )
+        if lighting_pages:
+            logger.info("  Lighting plan pages (0-indexed): %s", lighting_pages)
+        # Log raw classifications for debugging
+        for item in page_map.get("raw_classifications", []):
+            cat = item.get("category", "?")
+            reason = item.get("reason", "")
+            if cat != "OTHER":
+                logger.info("  Page %d → %s (%s)", item.get("page", 0), cat, reason)
 
     if not lighting_pages:
         logger.warning("PIPELINE ABORT: No lighting plan pages found")
@@ -79,7 +106,7 @@ def run_pipeline(pdf_path: str, output_dir: str = "data/output") -> dict:
             "status": "error",
             "fixture_counts": [],
             "csv_path": None,
-            "pages_analyzed": page_map,
+            "pages_analyzed": {},
             "pattern": None,
             "errors": ["No lighting plan pages identified in the PDF."],
         }
@@ -88,24 +115,29 @@ def run_pipeline(pdf_path: str, output_dir: str = "data/output") -> dict:
     pattern = "unit_multiplication" if unit_pages else "direct_counting"
     logger.info("Counting pattern: %s", pattern)
 
-    # --- Stage 3: Fixture Schedule ---
-    logger.info("[Stage 3/5] Parsing fixture schedule...")
+    # --- Stage 3: Fixture Type Discovery ---
+    logger.info("[Stage 3/5] Discovering fixture types...")
     t0 = time.time()
+    fixture_types = []
+
+    # Try schedule first if we have schedule pages
     if schedule_pages:
         logger.info("  Parsing schedule from pages (0-indexed): %s", schedule_pages)
         schedule_result = parse_fixture_schedule(pdf_path, schedule_pages)
-    else:
-        logger.warning("  No schedule pages identified by LLM in Stage 2.")
-        logger.warning("  This can happen when the fixture schedule is rasterized (image-based) rather than text.")
-        logger.warning("  The LLM may not have classified any page as FIXTURE_SCHEDULE.")
-        schedule_result = {"success": False, "fixture_types": [], "error": "No schedule pages found. The LLM did not classify any page as FIXTURE_SCHEDULE. The schedule may be rasterized (image-based)."}
+        if schedule_result["success"]:
+            fixture_types = [ft["type_code"] for ft in schedule_result["fixture_types"]]
+            logger.info("  Found %d types from schedule: %s", len(fixture_types), fixture_types[:10])
+        else:
+            logger.warning("  Schedule parse failed: %s", schedule_result["error"])
 
-    if not schedule_result["success"]:
-        logger.warning("[Stage 3/5] Failed in %.1fs — %s", time.time() - t0, schedule_result["error"])
-        errors.append(schedule_result["error"])
-        logger.warning("PIPELINE ABORT at Stage 3: Cannot proceed without fixture types from schedule.")
-        logger.warning("  Lighting pages found: %s", lighting_pages)
-        logger.warning("  Schedule pages found: %s", schedule_pages)
+    # Fallback: discover types directly from lighting plan pages
+    if not fixture_types:
+        logger.info("  No schedule available — discovering types from floor plans...")
+        fixture_types = _discover_fixture_types_from_pages(pdf_path, lighting_pages)
+        logger.info("  Discovered %d types from floor plans: %s", len(fixture_types), fixture_types[:20])
+
+    if not fixture_types:
+        logger.warning("[Stage 3/5] Failed — no fixture types found anywhere")
         return {
             "status": "error",
             "fixture_counts": [],
@@ -116,11 +148,10 @@ def run_pipeline(pdf_path: str, output_dir: str = "data/output") -> dict:
                 "unit_plans": unit_pages,
             },
             "pattern": pattern,
-            "errors": errors,
+            "errors": ["No fixture types found on any page."],
         }
 
-    fixture_types = [ft["type_code"] for ft in schedule_result["fixture_types"]]
-    logger.info("[Stage 3/5] Done in %.1fs — %d fixture types found: %s", time.time() - t0, len(fixture_types), fixture_types[:10])
+    logger.info("[Stage 3/5] Done in %.1fs — %d fixture types", time.time() - t0, len(fixture_types))
 
     # --- Stage 4: Counting ---
     logger.info("[Stage 4/5] Counting fixtures...")
@@ -158,6 +189,27 @@ def run_pipeline(pdf_path: str, output_dir: str = "data/output") -> dict:
         "pattern": pattern,
         "errors": errors,
     }
+
+
+def _discover_fixture_types_from_pages(pdf_path: str, page_indices: list[int]) -> list[str]:
+    """Discover fixture type codes from floor plan pages using pdfplumber.
+
+    Scans all words on the given pages, filters by fixture code patterns,
+    normalizes codes (DF01→DF1), and returns unique types sorted by frequency.
+    """
+    all_codes = Counter()
+    for page_idx in page_indices:
+        words = extract_page_words(pdf_path, page_idx)
+        for w in words:
+            text = w["text"].strip().upper()
+            if len(text) < 2 or len(text) > 10:
+                continue
+            if not _FIXTURE_TYPE_RE.match(text):
+                continue
+            normalized = normalize_fixture_code(text)
+            all_codes[normalized] += 1
+
+    return [code for code, _ in all_codes.most_common()]
 
 
 def _direct_counting(
