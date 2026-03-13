@@ -1,6 +1,8 @@
 import logging
+import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 import pdfplumber
 import fitz
 
@@ -382,41 +384,70 @@ def _map_sheets_to_pages(doc, sheet_numbers: set, page_count: int) -> dict:
     return sheet_map
 
 
-# --- Batch extraction ---
+# --- Batch extraction (parallel) ---
+
+# Cap workers to avoid opening too many file handles at once.
+_MAX_WORKERS = min(8, (os.cpu_count() or 4))
+
+
+def _extract_text_single(pdf_path: str, page_index: int) -> tuple[int, str]:
+    """Extract text from a single page (opens PDF independently)."""
+    with pdfplumber.open(pdf_path) as pdf:
+        if 0 <= page_index < len(pdf.pages):
+            return page_index, pdf.pages[page_index].extract_text() or ""
+    return page_index, ""
+
+
+def _extract_words_single(pdf_path: str, page_index: int) -> tuple[int, list[dict]]:
+    """Extract words from a single page (opens PDF independently)."""
+    with pdfplumber.open(pdf_path) as pdf:
+        if 0 <= page_index < len(pdf.pages):
+            words = pdf.pages[page_index].extract_words(
+                keep_blank_chars=False, use_text_flow=False
+            )
+            return page_index, [
+                {
+                    "text": w.get("text", ""),
+                    "x0": w.get("x0", 0),
+                    "y0": w.get("top", 0),
+                    "x1": w.get("x1", 0),
+                    "y1": w.get("bottom", 0),
+                }
+                for w in words
+            ]
+    return page_index, []
+
 
 def extract_pages_text_batch(pdf_path: str, page_indices: list[int]) -> dict[int, str]:
-    """Extract full text from multiple pages, opening PDF once.
+    """Extract full text from multiple pages in parallel.
     Returns {page_index: text}.
     """
     t0 = time.time()
-    result = {}
-    with pdfplumber.open(pdf_path) as pdf:
-        for idx in page_indices:
-            if 0 <= idx < len(pdf.pages):
-                result[idx] = pdf.pages[idx].extract_text() or ""
-    logger.info("extract_pages_text_batch: %d pages in %.1fs", len(result), time.time() - t0)
+    if len(page_indices) <= 1:
+        # No benefit from parallelism for 0-1 pages
+        result = dict(_extract_text_single(pdf_path, idx) for idx in page_indices)
+    else:
+        workers = min(_MAX_WORKERS, len(page_indices))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(_extract_text_single, pdf_path, idx) for idx in page_indices]
+            result = dict(f.result() for f in futures)
+    logger.info("extract_pages_text_batch: %d pages in %.1fs (workers=%d)",
+                len(result), time.time() - t0, min(_MAX_WORKERS, len(page_indices)))
     return result
 
 
 def extract_pages_words_batch(pdf_path: str, page_indices: list[int]) -> dict[int, list[dict]]:
-    """Extract words from multiple pages, opening PDF once.
+    """Extract words from multiple pages in parallel.
     Returns {page_index: [word_dicts]}.
     """
     t0 = time.time()
-    result = {}
-    with pdfplumber.open(pdf_path) as pdf:
-        for idx in page_indices:
-            if 0 <= idx < len(pdf.pages):
-                words = pdf.pages[idx].extract_words(keep_blank_chars=False, use_text_flow=False)
-                result[idx] = [
-                    {
-                        "text": w.get("text", ""),
-                        "x0": w.get("x0", 0),
-                        "y0": w.get("top", 0),
-                        "x1": w.get("x1", 0),
-                        "y1": w.get("bottom", 0),
-                    }
-                    for w in words
-                ]
-    logger.info("extract_pages_words_batch: %d pages in %.1fs", len(result), time.time() - t0)
+    if len(page_indices) <= 1:
+        result = dict(_extract_words_single(pdf_path, idx) for idx in page_indices)
+    else:
+        workers = min(_MAX_WORKERS, len(page_indices))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(_extract_words_single, pdf_path, idx) for idx in page_indices]
+            result = dict(f.result() for f in futures)
+    logger.info("extract_pages_words_batch: %d pages in %.1fs (workers=%d)",
+                len(result), time.time() - t0, min(_MAX_WORKERS, len(page_indices)))
     return result
