@@ -1,6 +1,6 @@
 import base64
 from app.config import (
-    LLM_PROVIDER, ANTHROPIC_API_KEY, OPENAI_API_KEY, GOOGLE_API_KEY,
+    LLM_PROVIDER, VISION_PROVIDER, ANTHROPIC_API_KEY, OPENAI_API_KEY, GOOGLE_API_KEY,
     ANTHROPIC_MODEL, OPENAI_MODEL, GOOGLE_MODEL,
 )
 
@@ -18,15 +18,16 @@ def llm_text_query(system: str, prompt: str) -> str:
 
 
 def llm_vision_query(system: str, prompt: str, image_bytes: bytes, image_media_type: str = "image/png") -> str:
-    """Send a vision query (text + image) to the configured LLM provider."""
-    if LLM_PROVIDER == "anthropic":
+    """Send a vision query (text + image) to the configured vision provider."""
+    provider = VISION_PROVIDER
+    if provider == "anthropic":
         return _anthropic_vision(system, prompt, image_bytes, image_media_type)
-    elif LLM_PROVIDER == "openai":
+    elif provider == "openai":
         return _openai_vision(system, prompt, image_bytes, image_media_type)
-    elif LLM_PROVIDER == "google":
+    elif provider == "google":
         return _google_vision(system, prompt, image_bytes, image_media_type)
     else:
-        raise ValueError(f"Unknown LLM_PROVIDER: {LLM_PROVIDER}")
+        raise ValueError(f"Unknown VISION_PROVIDER: {provider}")
 
 
 def _anthropic_text(system: str, prompt: str) -> str:

@@ -5,29 +5,17 @@ import time
 from collections import Counter
 from app.stages.classifier import classify_pdf
 from app.stages.page_classifier import classify_pages, detect_lighting_pages
-from app.stages.schedule_parser import parse_fixture_schedule
-from app.stages.counter import count_fixtures_multi_page, normalize_fixture_code
+from app.stages.schedule_parser import parse_fixture_schedule, EXCLUDE_WORDS
+from app.stages.counter import count_fixtures_multi_page
 from app.stages.llm_counter import count_fixtures_with_llm_multi_page
 from app.stages.reconciler import reconcile_counts, write_csv
 from app.config import CONFIDENCE_THRESHOLD
-from app.utils.pdf_utils import extract_page_words
+from app.utils.pdf_utils import (
+    parse_sheet_index,
+    extract_pages_words_batch,
+)
 
 logger = logging.getLogger(__name__)
-
-# Pattern for discovering fixture type codes from floor plan pages.
-# Uses known lighting fixture prefixes to avoid false positives from
-# sheet numbers (E-211), sensors (OS3), cables (CAT6E), etc.
-_FIXTURE_TYPE_RE = re.compile(
-    r'^('
-    r'D\d+[A-Z]?'       # D1A, D1B, D2 (downlights)
-    r'|L\d+[A-Z]?'      # L1A, L2A, L5, L6 (linear)
-    r'|L-\d+'           # L-8, L-22 (linear with dash)
-    r'|DF\d+'           # DF01, DF3 (decorative fixtures)
-    r'|X\d+'            # X1 (exit signs)
-    r'|B\d+[A-Z]?'     # B1, B2, B5
-    r'|U\d+[A-Z]?'     # U1, U2
-    r')(-EM)?$'
-)
 
 
 def run_fixture_discovery(pdf_path: str) -> dict:
@@ -108,37 +96,55 @@ def _classify_extractability(pdf_path: str) -> tuple[dict, dict | None]:
 
 
 def _detect_pages(pdf_path: str) -> tuple[dict, dict | None]:
-    """Detect lighting, schedule, and unit pages. Returns (page_result, error_or_None)."""
-    logger.info("Detecting lighting pages...")
-    t0 = time.time()
-    lighting_pages = detect_lighting_pages(pdf_path)
-    schedule_pages = []
-    unit_pages = []
+    """Detect lighting, schedule, and unit pages.
 
-    if lighting_pages:
+    Strategy (3-tier fallback):
+    1. Try parse_sheet_index() for deterministic detection (fast, reliable).
+    2. If no sheet index → try detect_lighting_pages() (fast regex scan via fitz).
+    3. If neither works → fall back to full LLM page classification.
+
+    Returns (page_result, error_or_None).
+    """
+    logger.info("Detecting pages...")
+
+    # Tier 1: Try sheet index parsing
+    t0 = time.time()
+    index_result = parse_sheet_index(pdf_path)
+    schedule_pages = index_result["schedule_pages"]
+    lighting_pages = index_result["lighting_pages"]
+    unit_pages = index_result["unit_pages"]
+
+    if schedule_pages or lighting_pages:
         logger.info(
-            "Page detection: Deterministic detection done in %.1fs — %d lighting pages: %s",
-            time.time() - t0, len(lighting_pages), lighting_pages,
+            "Page detection: Sheet index parsed in %.1fs — schedule=%s, lighting=%s, unit=%s",
+            time.time() - t0, schedule_pages, lighting_pages, unit_pages,
         )
     else:
-        logger.info("Page detection: No pages found deterministically, falling back to LLM classification...")
+        logger.info("Page detection: No sheet index found, trying deterministic detection...")
+
+    # Tier 2: If sheet index didn't find lighting pages, try fast regex detection
+    if not lighting_pages:
+        t0 = time.time()
+        lighting_pages = detect_lighting_pages(pdf_path)
+        if lighting_pages:
+            logger.info(
+                "Page detection: Deterministic detection in %.1fs — %d lighting pages: %s",
+                time.time() - t0, len(lighting_pages), lighting_pages,
+            )
+
+    # Tier 3: If still no lighting pages, fall back to full LLM classification
+    if not lighting_pages:
+        logger.info("Page detection: No pages found deterministically, falling back to LLM...")
         t0 = time.time()
         page_map = classify_pages(pdf_path)
         lighting_pages = page_map["lighting_plans"]
-        schedule_pages = page_map["fixture_schedules"]
+        if not schedule_pages:
+            schedule_pages = page_map["fixture_schedules"]
         unit_pages = page_map["unit_plans"]
-        other_pages = page_map["other"]
         logger.info(
-            "Page detection: LLM done in %.1fs — lighting=%d, schedule=%d, unit=%d, other=%d pages",
-            time.time() - t0, len(lighting_pages), len(schedule_pages), len(unit_pages), len(other_pages),
+            "Page detection: LLM done in %.1fs — lighting=%d, schedule=%d, unit=%d",
+            time.time() - t0, len(lighting_pages), len(schedule_pages), len(unit_pages),
         )
-        if lighting_pages:
-            logger.info("  Lighting plan pages (0-indexed): %s", lighting_pages)
-        for item in page_map.get("raw_classifications", []):
-            cat = item.get("category", "?")
-            reason = item.get("reason", "")
-            if cat != "OTHER":
-                logger.info("  Page %d → %s (%s)", item.get("page", 0), cat, reason)
 
     if not lighting_pages:
         logger.warning("PIPELINE ABORT: No lighting plan pages found")
@@ -162,27 +168,45 @@ def _detect_pages(pdf_path: str) -> tuple[dict, dict | None]:
 def _discover_types(
     pdf_path: str, lighting_pages: list[int], schedule_pages: list[int]
 ) -> tuple[list[str], dict | None]:
-    """Discover fixture types from schedule or floor plan pages. Returns (fixture_types, error_or_None)."""
+    """Discover fixture types using the 4-step pipeline.
+
+    Steps:
+    1. Schedule pages already identified by _detect_pages()
+    2. Extract schedule content (pdfplumber or LLM vision) — handled by schedule_parser
+    3. LLM extracts fixture types from schedule text — handled by schedule_parser
+    4. Cross-validate against floor plan words
+
+    Returns (fixture_types, error_or_None).
+    """
     logger.info("Discovering fixture types...")
     t0 = time.time()
     fixture_types = []
 
+    # Steps 2-3: Parse fixture schedule (text extraction + LLM type extraction)
     if schedule_pages:
         logger.info("  Parsing schedule from pages (0-indexed): %s", schedule_pages)
         schedule_result = parse_fixture_schedule(pdf_path, schedule_pages)
         if schedule_result["success"]:
             fixture_types = [ft["type_code"] for ft in schedule_result["fixture_types"]]
-            logger.info("  Found %d types from schedule: %s", len(fixture_types), fixture_types[:10])
+            logger.info("  Found %d types from schedule: %s", len(fixture_types), fixture_types[:20])
         else:
             logger.warning("  Schedule parse failed: %s", schedule_result["error"])
 
+    # Fallback: if no schedule types, discover from floor plan words
     if not fixture_types:
-        logger.info("  No schedule available — discovering types from floor plans...")
-        fixture_types = _discover_fixture_types_from_pages(pdf_path, lighting_pages)
-        logger.info("  Discovered %d types from floor plans: %s", len(fixture_types), fixture_types[:20])
+        logger.info("  No schedule types found — falling back to floor plan discovery...")
+        floor_words = _extract_floor_plan_words(pdf_path, lighting_pages[:3])
+        seen = set()
+        for word in floor_words:
+            if word not in EXCLUDE_WORDS and re.match(r'^[A-Z]+[-]?\d', word):
+                if word not in seen:
+                    fixture_types.append(word)
+                    seen.add(word)
+        if fixture_types:
+            logger.info("  Discovered %d types from floor plans: %s", len(fixture_types), fixture_types[:20])
 
     if not fixture_types:
-        logger.warning("Type discovery: Failed — no fixture types found anywhere")
+        logger.warning("  No fixture types found anywhere")
         return [], {
             "status": "error",
             "fixture_types": [],
@@ -190,8 +214,15 @@ def _discover_types(
             "csv_path": None,
             "pages_analyzed": {},
             "pattern": None,
-            "errors": ["No fixture types found on any page."],
+            "errors": ["No fixture types found in schedule or floor plan pages."],
         }
+
+    # Step 4: Cross-validate against floor plan words
+    logger.info("  Cross-validating against %d lighting plan pages...", len(lighting_pages))
+    t1 = time.time()
+    floor_plan_words = _extract_floor_plan_words(pdf_path, lighting_pages[:3])
+    fixture_types = _cross_validate_types(fixture_types, floor_plan_words)
+    logger.info("  Cross-validation done in %.1fs — %d final types", time.time() - t1, len(fixture_types))
 
     logger.info("Type discovery: Done in %.1fs — %d fixture types", time.time() - t0, len(fixture_types))
     return fixture_types, None
@@ -276,25 +307,73 @@ def run_pipeline(pdf_path: str, output_dir: str = "data/output") -> dict:
     }
 
 
-def _discover_fixture_types_from_pages(pdf_path: str, page_indices: list[int]) -> list[str]:
-    """Discover fixture type codes from floor plan pages using pdfplumber.
-
-    Scans all words on the given pages, filters by fixture code patterns,
-    normalizes codes (DF01→DF1), and returns unique types sorted by frequency.
-    """
-    all_codes = Counter()
-    for page_idx in page_indices:
-        words = extract_page_words(pdf_path, page_idx)
-        for w in words:
+def _extract_floor_plan_words(pdf_path: str, page_indices: list[int]) -> list[str]:
+    """Extract short uppercase words from floor plan pages for cross-validation."""
+    if not page_indices:
+        return []
+    words_by_page = extract_pages_words_batch(pdf_path, page_indices)
+    all_words = []
+    for idx in page_indices:
+        for w in words_by_page.get(idx, []):
             text = w["text"].strip().upper()
-            if len(text) < 2 or len(text) > 10:
-                continue
-            if not _FIXTURE_TYPE_RE.match(text):
-                continue
-            normalized = normalize_fixture_code(text)
-            all_codes[normalized] += 1
+            if 2 <= len(text) <= 10:
+                all_words.append(text)
+    return all_words
 
-    return [code for code, _ in all_codes.most_common()]
+
+def _cross_validate_types(
+    schedule_types: list[str], floor_plan_words: list[str]
+) -> list[str]:
+    """Cross-validate schedule types against floor plan words.
+
+    Checks which schedule types appear on floor plans.
+    Also detects potential missed types that share a prefix (2+ letters) with
+    known schedule types, filtering out room/drawing numbers.
+
+    Returns combined list of types (schedule types + floor-plan-only candidates).
+    """
+    if not floor_plan_words:
+        return schedule_types
+
+    # Build prefix set from schedule types — require 2+ letter prefixes
+    # to avoid matching room numbers (A103) against single-letter prefixes (A from AL1)
+    prefixes = set()
+    for t in schedule_types:
+        m = re.match(r'^([A-Z]{2,})', t.upper())
+        if m:
+            prefixes.add(m.group(1))
+
+    # Find floor plan words that match schedule type prefixes
+    schedule_set = {t.upper() for t in schedule_types}
+    candidates = set()
+    word_counts = Counter(floor_plan_words)
+
+    for word, count in word_counts.items():
+        if word in schedule_set:
+            continue
+        if word in EXCLUDE_WORDS:
+            continue
+        # Must be short enough to be a fixture code (not a long description)
+        if len(word) > 8:
+            continue
+        # Check if word shares a 2+ letter prefix with any schedule type
+        m = re.match(r'^([A-Z]{2,})', word)
+        if m and m.group(1) in prefixes:
+            # Must look like a fixture code: letters followed by digit or paren
+            if re.match(r'^[A-Z]{2,}[-]?\d', word) or re.match(r'^[A-Z]+\(', word):
+                candidates.add(word)
+
+    if candidates:
+        logger.info("  Cross-validation: %d floor-plan-only candidates: %s",
+                     len(candidates), sorted(candidates))
+
+    # Combine: schedule types first, then floor-plan-only candidates
+    result = list(schedule_types)
+    for c in sorted(candidates):
+        if c not in schedule_set:
+            result.append(c)
+
+    return result
 
 
 def _direct_counting(
