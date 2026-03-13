@@ -1,0 +1,25 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(*)",
+      "Read(*)",
+      "Edit(*)",
+      "Write(*)",
+      "Glob(*)",
+      "Grep(*)",
+      "Agent(*)",
+      "Skill(*)",
+      "WebFetch(*)",
+      "WebSearch(*)",
+      "NotebookEdit(*)",
+      "LSP(*)",
+      "mcp__figma__*",
+      "mcp__claude_ai_Gmail__*",
+      "mcp__ide__*"
+    ],
+    "ask": [
+      "Bash(rm *)",
+      "Bash(unlink *)"
+    ]
+  }
+}
