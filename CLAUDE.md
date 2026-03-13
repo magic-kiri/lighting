@@ -27,7 +27,7 @@ Automate the "lighting fixture takeoff" process for Commercial Lighting Industri
 5. **Stage 5 — Output** (`app/stages/reconciler.py`): Writes CSV with Type, Quantity, Confidence, Note
 
 Pipeline orchestrator: `app/pipeline.py`
-FastAPI endpoint: `app/main.py` — `POST /extract` (PDF upload), `GET /health`
+FastAPI endpoint: `app/main.py` — `POST /extract` (full pipeline), `POST /fixtures` (type discovery only), `GET /health`
 Frontend: `frontend/index.html` — Single-page UI for uploading PDFs and viewing results
 
 ## Tech Stack
@@ -115,6 +115,15 @@ uvicorn app.main:app --reload --port 8000
 # Extract fixtures from a PDF
 curl -X POST "http://localhost:8000/extract" -F "file=@your-drawing.pdf"
 ```
+
+## Verification
+
+See `docs/fixture-type-verification.md` for the full process. Summary:
+
+- **After any change to fixture type extraction**, run `POST /fixtures` against both test PDFs and compare results to ground-truth CSVs.
+- **Ground-truth CSVs**: `chase-bank-newport-beach-counts.csv` (30 types), `amli-brea-counts.csv` (83 types).
+- **Metrics**: Recall (did we find all expected types?) and Precision (did we avoid false positives?). Both must be 100% target, and neither may regress from the recorded baseline.
+- **Key rule**: If the ground-truth CSV shows a type with a non-zero quantity, the API must return that type. Types with zero or empty quantity are also expected but lower priority.
 
 ## Technical Notes
 - Only Bluebeam-exported PDFs are supported in v1 (direct AutoCAD exports have SHX vector strokes, not extractable text)
