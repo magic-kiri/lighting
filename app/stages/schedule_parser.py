@@ -119,14 +119,15 @@ def parse_fixture_schedule(pdf_path: str, page_indices: list[int]) -> dict:
     }
 
 
-_VISION_EXTRACT_PROMPT = """Look at this lighting fixture schedule page from an engineering drawing.
+_VISION_EXTRACT_PROMPT = """Look at this section of a lighting fixture schedule from an engineering drawing.
 Extract ALL unique fixture type codes from the TYPE column.
 
 Rules:
-- Type codes are short identifiers like D1A, L-22, DF01, SS9, BX(S), LT-104.1
-- Include EM (emergency) variants as separate types (e.g., D1A-EM, LP1 EM)
+- Type codes are short identifiers: D1A, L-2, L-7, L-22, DF01, SS9, L500, L8, BX(S), LT-104.1
+- Codes may be very short (L-2, L8, D2, X1) or dash-separated (L-411, LT-104)
+- Include EM (emergency) variants as separate types (e.g., D1A-EM, LP1 EM, L8EM, L500-EM)
 - Include compound types (e.g., AS1/AS2, SC1/SC3)
-- Include size variants that are part of the code (e.g., B1.8', B1.12')
+- Read EVERY row in the table, even partially visible ones
 - Do NOT include descriptions, manufacturers, wattages, or catalog numbers
 - Only report codes you can CLEARLY read — do not guess or invent codes
 
@@ -134,14 +135,55 @@ Return ONLY valid JSON: {{"fixture_types": ["TYPE1", "TYPE2", ...]}}"""
 
 
 def _extract_types_with_vision(pdf_path: str, page_index: int) -> list[str]:
-    """Render a page and directly extract fixture type codes via LLM vision."""
+    """Render a page and extract fixture type codes via LLM vision.
+
+    Uses image sectioning: splits the full page into 3 overlapping horizontal
+    sections to improve OCR accuracy. Dense engineering drawings are too large
+    for vision models to read in one pass — sectioning lets the model focus on
+    each part of the schedule.
+    """
     try:
         image_bytes = render_page_to_image(pdf_path, page_index, dpi=200)
-        logger.info("  Sending %.1f KB image to vision LLM...", len(image_bytes) / 1024)
-        response = llm_vision_query(
-            _VISION_OCR_SYSTEM, _VISION_EXTRACT_PROMPT, image_bytes
-        )
-        return _parse_fixture_types_response(response)
+        logger.info("  Rendering page %d: %.1f KB image", page_index, len(image_bytes) / 1024)
+
+        # Split into overlapping sections for better coverage
+        import io
+        from PIL import Image
+
+        img = Image.open(io.BytesIO(image_bytes))
+        w, h = img.size
+        all_types = []
+
+        # 3 overlapping horizontal sections: 0-40%, 30-70%, 60-100%
+        sections = [
+            ("top", 0.0, 0.4),
+            ("mid", 0.3, 0.7),
+            ("bot", 0.6, 1.0),
+        ]
+
+        # Per-section cap: a real schedule section shows at most ~40 types.
+        # If vision returns more, the model is hallucinating — discard that section.
+        _MAX_TYPES_PER_SECTION = 60
+
+        for name, top_frac, bot_frac in sections:
+            crop = img.crop((0, int(h * top_frac), w, int(h * bot_frac)))
+            buf = io.BytesIO()
+            crop.save(buf, format="PNG")
+            section_bytes = buf.getvalue()
+            logger.info("  Vision %s section (%.0f%%–%.0f%%): %.1f KB",
+                        name, top_frac * 100, bot_frac * 100, len(section_bytes) / 1024)
+            response = llm_vision_query(
+                _VISION_OCR_SYSTEM, _VISION_EXTRACT_PROMPT, section_bytes
+            )
+            section_types = _parse_fixture_types_response(response)
+            if len(section_types) > _MAX_TYPES_PER_SECTION:
+                logger.warning("  Vision %s section: %d types — DISCARDED (exceeds %d cap)",
+                               name, len(section_types), _MAX_TYPES_PER_SECTION)
+            else:
+                logger.info("  Vision %s section: %d types", name, len(section_types))
+                all_types.extend(section_types)
+
+        return all_types
     except Exception as e:
         logger.warning("  Vision extraction failed for page %d: %s", page_index, e)
         return []
