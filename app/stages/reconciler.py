@@ -16,8 +16,11 @@ def reconcile_counts(
         llm_count = llm_counts.get(type_code, 0)
         diff = abs(pdf_count - llm_count)
 
+        # pdfplumber is the source of truth for quantity;
+        # fall back to LLM only when pdfplumber found 0.
+        quantity = pdf_count if pdf_count > 0 else llm_count
+
         if diff <= threshold:
-            quantity = llm_count if llm_count > 0 else pdf_count
             results.append({
                 "type": type_code,
                 "quantity": quantity,
@@ -25,7 +28,6 @@ def reconcile_counts(
                 "note": "",
             })
         else:
-            quantity = llm_count if llm_count > 0 else pdf_count
             results.append({
                 "type": type_code,
                 "quantity": quantity,

@@ -25,7 +25,7 @@ def test_within_threshold_is_high():
     llm_counts = {"D1A": 37}
     result = reconcile_counts(pdfplumber_counts, llm_counts, threshold=2)
     assert result[0]["confidence"] == "high"
-    assert result[0]["quantity"] == 37
+    assert result[0]["quantity"] == 38  # pdfplumber takes priority
 
 
 def test_type_in_one_but_not_other():
