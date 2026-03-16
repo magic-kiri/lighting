@@ -108,11 +108,29 @@ For each dataset, compute:
 3. **Recall** — `matched / total_expected` as a percentage.
 4. **Precision** — `matched / total_returned` as a percentage.
 
-When comparing, normalize by stripping size suffixes in parentheses from both sides:
+When comparing, apply the following normalization to both sides:
+
+**1. Strip size/variant suffixes in parentheses:**
 - `L1A (4')` → `L1A`
 - `X1 (SF)` → `X1`
 - But `B1.8'` stays `B1.8'` (size is part of the code, not parenthesized)
 - `WS1 4'8"` → `WS1`
+
+**2. Normalize formatting variations in the base type code:**
+
+After stripping suffixes, treat two type codes as equivalent if they differ only in separators, whitespace, or surrounding punctuation. Specifically, remove all dashes (`-`), spaces, underscores (`_`), quotes (`"`, `'`, `` ` ``), and any other non-alphanumeric/non-dot/non-slash characters, then compare case-insensitively.
+
+Examples (all normalize to the same canonical form):
+- `L1`, `L-1`, `L 1`, `L_1`, `"L1"` → all match
+- `L1A-EM`, `L1A EM`, `L1AEM` → all match
+- `DF-3`, `DF3`, `DF 3` → all match
+
+Characters that are **preserved** during normalization (they carry meaning):
+- Dots (`.`): `LT-104.1` and `LT-104.2` remain distinct
+- Slashes (`/`): `AS1/AS2` and `SC1/SC3` remain compound types
+- Alphanumeric characters: always preserved
+
+This means the system should not penalize the extraction pipeline for returning `L-1` when the ground truth says `L1`, or vice versa — they are considered a match.
 
 ### Step 3: Report results
 
@@ -146,14 +164,33 @@ After running verification, update the table below with current results so futur
 
 | Date | Dataset | Recall | Precision | Missing | False Positives | Notes |
 |------|---------|--------|-----------|---------|-----------------|-------|
-| — | Chase Bank | — | — | — | — | Not yet baselined |
-| — | AMLI BREA | — | — | — | — | Not yet baselined |
+| 2026-03-16 | Chase Bank | 70.0% (21/30) | 87.5% (21/24) | 9 (rasterized schedule only) | 3 | Multi-run Gemini (3×) for rasterized schedule. Best precision achieved. |
+| 2026-03-16 | AMLI BREA | 73.9% (82/111) | 64.1% (82/128) | 28 (rasterized schedule + rare types) | 46 | Multi-run Gemini + pdfplumber floor plans. Text schedule has 13 types. |
+
+### Approaches tried
+
+| Approach | Chase Recall/Precision | AMLI Recall/Precision | Outcome |
+|----------|----------------------|----------------------|---------|
+| pdfplumber + single Gemini vision | 66-97% / 73-85% | 57-75% / 41-57% | Non-deterministic, best single-run: 96.7%/85.3% |
+| pdfplumber + dual-model (Gemini+GPT-4.1) | 60-100% / 40-85% | 67-84% / 13-57% | GPT-4.1 hallucinates cross-project types |
+| Vision-first (GPT-4.1 on all pages) | 23% / 58% | N/A | GPT can't distinguish fixture codes from room numbers |
+| Multi-run GPT-4.1 (3× per schedule page) | 63% / 10-20% | 84% / 26% | Massive FP explosion from GPT hallucinations |
+| **Multi-run Gemini (3× per schedule page)** | **70% / 87.5%** | **73.9% / 64.1%** | **Best balance. Current approach.** |
+
+### Known limitations (rasterized schedules)
+
+Both PDFs have fixture schedule pages embedded as **rasterized images** (not extractable text). This limits accuracy because:
+1. Only vision LLM can read the schedule content (non-deterministic)
+2. Gemini 2.5 Flash misses types inconsistently across runs — multi-run (3×) helps but doesn't fully solve
+3. GPT-4.1 reads more types but hallucinates cross-project types (unusable for precision)
+4. A valid Anthropic API key (Claude Sonnet) would significantly improve rasterized schedule OCR accuracy
+5. For AMLI, 20+ of the 111 expected types exist ONLY on rasterized schedule pages — not extractable by pdfplumber
 
 ## Common failure patterns to watch for
 
 1. **Regex too narrow**: The `_FIXTURE_TYPE_RE` pattern in `pipeline.py` only matches certain prefixes. New projects may have prefixes not yet covered (e.g., `AL`, `BH`, `GA`, `SS`, `RD`, `WR`).
 2. **EM variant dropped**: Types ending in `-EM` or ` EM` (space-separated) may not match if the regex or normalization strips them.
-3. **Dash normalization**: `L-22` vs `L22`, `LT106` vs `LT-106` — the system must preserve the original formatting from the PDF, not re-normalize arbitrarily.
+3. **Separator normalization**: During verification comparison, formatting differences like `L-22` vs `L22`, `LT106` vs `LT-106`, `L 1` vs `L1` are normalized away (see Step 2). However, dots and slashes carry meaning and must not be stripped.
 4. **Compound types**: `AS1/AS2`, `SC1/SC3` — slash-separated compound types are valid.
 5. **Schedule-only types**: Some types (like `DF6`, `DF7` with qty 0) only appear in the fixture schedule, not on floor plans. If schedule parsing is skipped, these will be missed.
 6. **Size-embedded codes**: `B1.8'`, `B1.12'`, `LT-104.1` — dot-separated variants are distinct types, not size suffixes to strip.

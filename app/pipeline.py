@@ -5,7 +5,7 @@ import time
 from collections import Counter
 from app.stages.classifier import classify_pdf
 from app.stages.page_classifier import classify_pages, detect_lighting_pages
-from app.stages.schedule_parser import parse_fixture_schedule, EXCLUDE_WORDS
+from app.stages.schedule_parser import parse_fixture_schedule, EXCLUDE_WORDS, _PANEL_PREFIXES
 from app.stages.counter import count_fixtures_multi_page
 from app.stages.llm_counter import count_fixtures_with_llm_multi_page
 from app.stages.reconciler import reconcile_counts, write_csv
@@ -27,8 +27,9 @@ logger = logging.getLogger(__name__)
 # identifiers, not fixture type codes.
 
 # Standard code: 1-2 letters, optional dash/dot, digits, optional suffix
+# Dot-digit suffix limited to 1-2 digits (LT-104.1, not A2-330)
 _PAT_STANDARD = re.compile(
-    r"^[A-Z]{1,2}[-.]?\d+[A-Z]?(?:[.-]\d+)?[']?$"
+    r"^[A-Z]{1,2}[-.]?\d+[A-Z]?(?:\.\d{1,2})?[']?$"
 )
 # EM variants: D1A-EM, L500-EM, L8EM
 _PAT_EM = re.compile(r"^[A-Z]{1,2}[-.]?\d+[A-Z]?-?EM$")
@@ -235,13 +236,14 @@ def _discover_types(
                 logger.info("  Schedule (text): %d types", len(text_schedule_types))
 
         # --- Step 1b: Rasterized schedule pages (vision, needs filtering) ---
-        # Process each rasterized page individually so we can track per-page
-        # prefix appearances for cross-page consensus filtering.
+        # Always use dual-model (GPT-4.1 + Gemini) for rasterized pages.
+        # GPT-4.1 hallucinations are filtered downstream by floor plan cross-ref.
+        use_dual = True
         if raster_pages:
-            logger.info("  Schedule (vision): parsing %d rasterized pages individually: %s",
-                        len(raster_pages), raster_pages)
+            logger.info("  Schedule (vision): parsing %d rasterized pages individually: %s (dual_model=%s)",
+                        len(raster_pages), raster_pages, use_dual)
             for rp in raster_pages:
-                result = parse_fixture_schedule(pdf_path, [rp])
+                result = parse_fixture_schedule(pdf_path, [rp], use_dual_model=use_dual)
                 if result["success"]:
                     page_types = _normalize_schedule_output(
                         [ft["type_code"] for ft in result["fixture_types"]]
@@ -254,14 +256,20 @@ def _discover_types(
             for types in vision_types_by_page.values():
                 raw_vision_types.extend(types)
 
-    # --- Step 2: Floor plan word extraction from lighting + unit pages ---
+    # --- Step 2: Floor plan word extraction ---
+    # Start with detected lighting + unit pages, then add high-density electrical pages
     scan_pages = sorted(set(lighting_pages + unit_pages))
-    logger.info("  Floor plans: scanning %d pages %s for fixture codes...",
-                len(scan_pages), scan_pages)
+    additional = _find_all_fixture_pages(pdf_path, scan_pages + schedule_pages, min_codes=15)
+    if additional:
+        logger.info("  Found %d high-density electrical pages: %s", len(additional), additional)
+        scan_pages = sorted(set(scan_pages + additional))
+    logger.info("  Floor plans: scanning %d pages for fixture codes...", len(scan_pages))
     t1 = time.time()
     words_by_page = extract_pages_words_batch(pdf_path, scan_pages)
     logger.info("  Floor plans: word extraction done in %.1fs", time.time() - t1)
 
+    # Use ONLY text schedule types as trusted anchor for floor plan scanning.
+    # Vision types are too noisy to use as anchors — they contaminate the prefix set.
     text_schedule_set = {t.upper() for t in text_schedule_types}
     floor_plan_types = _find_fixture_codes_in_words(words_by_page, text_schedule_set)
     logger.info("  Floor plans: %d candidate types", len(floor_plan_types))
@@ -296,17 +304,46 @@ def _normalize_schedule_output(raw_types: list[str]) -> list[str]:
     """Normalize and filter schedule parser output.
 
     Applies: leading zero strip (DF01→DF1), fixture code pattern check,
-    EM variant handling.
+    EM variant handling, letter-only code acceptance from schedules.
     """
     result = []
     for t in raw_types:
         norm = _normalize_type_code(t)
         upper = norm.upper()
-        if _looks_like_fixture_code(upper) or " EM" in upper or "-EM" in upper:
+        if upper in EXCLUDE_WORDS:
+            logger.debug("  Schedule: dropping excluded word: %s", t)
+            continue
+        if _looks_like_fixture_code(upper) or " EM" in upper or "-EM" in upper or upper.endswith("EM"):
+            result.append(norm)
+        elif _looks_like_schedule_code(upper):
+            # Accept letter-only codes from schedules (GA, XA, XK, AL1, etc.)
             result.append(norm)
         else:
             logger.debug("  Schedule: dropping non-fixture code: %s", t)
     return result
+
+
+def _looks_like_schedule_code(word: str) -> bool:
+    """Check if a word looks like a fixture code from a schedule.
+
+    More permissive than _looks_like_fixture_code — accepts letter-only
+    codes (GA, XA, XK) since schedule context confirms they are fixture types.
+    Also accepts parenthesized codes like BX(S), BX(D).
+    """
+    if not word or len(word) < 2 or len(word) > 12:
+        return False
+    if not word[0].isalpha():
+        return False
+    # Letter-only: 2-3 uppercase letters (GA, XA, XK, AL1 would have digits)
+    if re.match(r'^[A-Z]{2,3}$', word):
+        return True
+    # Parenthesized: BX(S), BX(D)
+    if _PAT_PAREN.match(word):
+        return True
+    # POLE variant
+    if _PAT_POLE.match(word):
+        return True
+    return False
 
 
 def _filter_vision_hallucinations(
@@ -341,8 +378,8 @@ def _filter_vision_hallucinations(
         if m:
             alpha_groups.setdefault(m.group(1), set()).add(m.group(2))
 
-    # Bases with 5+ letter variants are suspicious
-    suspect_alpha = {base for base, suffixes in alpha_groups.items() if len(suffixes) >= 5}
+    # Bases with 3+ letter variants are suspicious (hallucination pattern)
+    suspect_alpha = {base for base, suffixes in alpha_groups.items() if len(suffixes) >= 3}
     if suspect_alpha:
         logger.info("  Vision filter: suspect alphabetic bases: %s", sorted(suspect_alpha))
 
@@ -373,16 +410,54 @@ def _filter_vision_hallucinations(
                 logger.info("  Vision filter: suspect numeric sequence: %s (%d types in range %d–%d, density=%.0f%%)",
                             prefix_part, len(numbers), min(numbers), max(numbers), density * 100)
 
+    # --- Build prefix information for filtering ---
+    # Collect all vision type prefixes
+    vision_prefix_count: dict[str, int] = {}
+    for t in vision_types:
+        m = re.match(r'^([A-Z]+)', t.upper())
+        if m:
+            vision_prefix_count[m.group(1)] = vision_prefix_count.get(m.group(1), 0) + 1
+
+    # Floor plan prefixes
+    floor_prefixes = set()
+    for t in floor_plan_types:
+        m = re.match(r'^([A-Z]+)', t.upper())
+        if m:
+            floor_prefixes.add(m.group(1))
+
+    # Text schedule prefixes
+    text_prefixes = set()
+    for t in text_schedule_types:
+        m = re.match(r'^([A-Z]+)', t.upper())
+        if m:
+            text_prefixes.add(m.group(1))
+
+    known_prefixes = floor_prefixes | text_prefixes
+
+    # --- Build set of base types (without EM) that are in the results ---
+    all_result_bases = set()
+    for t in vision_types:
+        upper = t.upper()
+        # Strip EM suffix to get base
+        base = re.sub(r'[- ]?EM$', '', upper).strip()
+        all_result_bases.add(_normalize_type_code(base))
+    for t in text_schedule_types:
+        all_result_bases.add(_normalize_type_code(t.upper()))
+    for t in floor_plan_types:
+        all_result_bases.add(_normalize_type_code(t.upper()))
+
     # --- Filter ---
     filtered = []
     seen = set()
     for t in vision_types:
         upper = t.upper()
         norm = _normalize_type_code(upper)
+        dedup = _dedup_key(upper)
 
         # Deduplicate within vision types
-        if norm in seen:
+        if dedup in seen:
             continue
+        seen.add(dedup)
         seen.add(norm)
         seen.add(upper)
 
@@ -390,8 +465,17 @@ def _filter_vision_hallucinations(
         if norm in text_set or upper in text_set:
             continue
 
+        # Drop ambiguous letter-only codes from vision (ED, SF, etc.)
+        # But allow real fixture letter-only codes (XK, XA, GA)
+        _LETTER_ONLY_EXCLUDE = {'ED', 'SF', 'AC', 'DC', 'EM', 'AM', 'PM', 'IC', 'ID',
+                                 'IS', 'IT', 'IF', 'CB', 'FL', 'EX'}
+        if re.match(r'^[A-Z]{2,3}$', upper):
+            if upper in _LETTER_ONLY_EXCLUDE and upper not in text_set:
+                logger.debug("  Vision filter: dropping %s (ambiguous letter-only code)", t)
+                continue
+
         # Alphabetic suffix hallucination: keep only A and B variants
-        m_alpha = re.match(r'^([A-Z]{1,2}[-.]?\d+)([A-Z])$', upper)
+        m_alpha = re.match(r'^([A-Z]{1,2}[-.]?\d+)([A-Z])(?:[- ]?EM)?$', upper)
         if m_alpha and m_alpha.group(1) in suspect_alpha:
             suffix = m_alpha.group(2)
             if suffix not in ('A', 'B'):
@@ -407,6 +491,38 @@ def _filter_vision_hallucinations(
                     logger.debug("  Vision filter: dropping %s (numeric hallucination, not on floor plans)", t)
                     continue
 
+        # EM variant validation: only keep if base type is in results
+        em_match = re.match(r'^(.+?)[- ]?EM$', upper)
+        if em_match:
+            base = _normalize_type_code(em_match.group(1).strip())
+            if base not in all_result_bases:
+                logger.debug("  Vision filter: dropping %s (EM variant without base type)", t)
+                continue
+
+        # Compound type validation: at least one side must be in floor plan or text schedule
+        compound = re.match(r'^([A-Z]{1,2}\d+[A-Z]?)/([A-Z]{1,2}\d+[A-Z]?)$', upper)
+        if compound:
+            left, right = compound.group(1), compound.group(2)
+            left_norm = _normalize_type_code(left)
+            right_norm = _normalize_type_code(right)
+            if (left_norm not in floor_set and left_norm not in text_set and
+                right_norm not in floor_set and right_norm not in text_set):
+                logger.debug("  Vision filter: dropping %s (compound type, neither side confirmed)", t)
+                continue
+
+        # Unknown prefix filter: types whose prefix is NOT in floor plans or text schedule
+        # AND has fewer than 3 types with that prefix → likely cross-project hallucination
+        m_prefix = re.match(r'^([A-Z]+)', upper)
+        if m_prefix:
+            prefix = m_prefix.group(1)
+            if prefix not in known_prefixes:
+                prefix_n = vision_prefix_count.get(prefix, 0)
+                if prefix_n < 2:
+                    if norm not in floor_set and upper not in floor_set:
+                        logger.debug("  Vision filter: dropping %s (unknown prefix %s, count=%d, not on floor plans)",
+                                     t, prefix, prefix_n)
+                        continue
+
         filtered.append(t)
 
     dropped = len(vision_types) - len(filtered)
@@ -414,6 +530,56 @@ def _filter_vision_hallucinations(
         logger.info("  Vision filter: dropped %d/%d types", dropped, len(vision_types))
 
     return filtered
+
+
+def _discover_types_v2(
+    pdf_path: str,
+    lighting_pages: list[int],
+    schedule_pages: list[int],
+    unit_pages: list[int] | None = None,
+) -> tuple[list[str], dict | None]:
+    """Discover fixture types using GPT-4.1 vision on all classified pages.
+
+    Strategy: render each classified page to an image, send to GPT-4.1,
+    aggregate types across pages with frequency-based filtering.
+    """
+    from app.stages.vision_scanner import scan_pages_for_types, aggregate_types
+
+    logger.info("Discovering fixture types (vision-first approach)...")
+    t0 = time.time()
+    unit_pages = unit_pages or []
+
+    # Combine all classified pages
+    all_pages = sorted(set(schedule_pages + lighting_pages + unit_pages))
+
+    # Add high-density electrical plan pages
+    additional = _find_all_fixture_pages(pdf_path, all_pages, min_codes=40)
+    if additional:
+        logger.info("  Found %d additional electrical pages", len(additional))
+        all_pages = sorted(set(all_pages + additional))
+
+    logger.info("  Scanning %d pages with vision: %s", len(all_pages), all_pages)
+
+    # Vision scan all pages in parallel
+    page_types = scan_pages_for_types(pdf_path, all_pages, dpi=200, max_workers=4)
+
+    # Aggregate with frequency-based filtering
+    all_types = aggregate_types(page_types, schedule_pages)
+
+    if not all_types:
+        logger.warning("  No fixture types found")
+        return [], {
+            "status": "error",
+            "fixture_types": [],
+            "fixture_counts": [],
+            "csv_path": None,
+            "pages_analyzed": {},
+            "pattern": None,
+            "errors": ["No fixture types found via vision scanning."],
+        }
+
+    logger.info("Vision discovery: %d types in %.1fs", len(all_types), time.time() - t0)
+    return all_types, None
 
 
 def run_pipeline(pdf_path: str, output_dir: str = "data/output") -> dict:
@@ -532,6 +698,10 @@ def _looks_like_fixture_code(word: str) -> bool:
     # Reject sheet/section references: E0.04, A.3, etc.
     if _PAT_SHEET_REF.match(word):
         return False
+    # Reject panel/circuit references: MP-11, HP-2, EP-1
+    prefix_m = re.match(r'^([A-Z]+)', word)
+    if prefix_m and prefix_m.group(1) in _PANEL_PREFIXES:
+        return False
     return any(p.match(word) for p in _FIXTURE_PATTERNS)
 
 
@@ -546,6 +716,62 @@ def _normalize_type_code(code: str) -> str:
     if m:
         return m.group(1) + m.group(2) + m.group(3)
     return code
+
+
+def _find_all_fixture_pages(
+    pdf_path: str,
+    already_included: list[int],
+    min_codes: int = 10,
+) -> list[int]:
+    """Find additional ELECTRICAL PLAN pages with fixture codes.
+
+    Only includes pages whose title contains PLAN/ELECTRICAL and has
+    enough fixture-like codes. Excludes specs, details, schedules, notes.
+    """
+    import fitz
+
+    fixture_re = re.compile(r'\b[A-Z]{1,2}[-.]?\d+[A-Z]?\b')
+    excluded = set(already_included)
+    # Pages types to EXCLUDE — these don't have fixture labels to count
+    exclude_always = {'DETAIL', 'SCHEDULE', 'NOTE', 'SPEC', 'DIAGRAM',
+                      'RISER', 'CALCULATION', 'COVER', 'INDEX', 'LEGEND',
+                      'DEMOLITION', 'DEMO', 'SINGLE LINE', 'PANEL', 'PLUMBING'}
+    additional = []
+
+    doc = fitz.open(pdf_path)
+    t0 = time.time()
+    for i in range(doc.page_count):
+        if i in excluded:
+            continue
+        text = doc[i].get_text()
+        if not text:
+            continue
+        # Check title block (last few lines) for page type
+        lines = text.strip().split('\n')
+        tail = ' '.join(l.strip().upper() for l in lines[-8:])
+
+        # Must have an E-prefix sheet number (electrical page)
+        if not re.search(r'\bE[-.]?\d', tail):
+            continue
+        # Must have PLAN or ELECTRICAL in title
+        if 'PLAN' not in tail and 'ELECTRICAL' not in tail:
+            continue
+        # Exclude non-fixture page types
+        if any(w in tail for w in exclude_always):
+            continue
+        # POWER and MECHANICAL excluded unless page also says LIGHTING
+        if ('POWER' in tail or 'MECHANICAL' in tail) and 'LIGHTING' not in tail:
+            continue
+
+        # Count fixture-like codes (exclude sheet references like E3.1.1)
+        matches = [m for m in fixture_re.findall(text)
+                   if len(m) <= 8 and not m.startswith('E')]
+        if len(matches) >= min_codes:
+            additional.append(i)
+    doc.close()
+    logger.info("  Fixture page scan: %d additional plan pages in %.1fs",
+                len(additional), time.time() - t0)
+    return additional
 
 
 def _find_fixture_codes_in_words(
@@ -593,16 +819,20 @@ def _find_fixture_codes_in_words(
         code_max_page.setdefault(ct, 1)
 
     # Build prefix sets from schedule types
+    # FIX: Track single-letter vs multi-letter schedule prefixes separately.
+    # AL1 contributes "AL" to schedule_prefixes, NOT "A" — this prevents
+    # apartment numbers (A125, A317) from piggy-backing on AL1's prefix.
     schedule_prefixes = set()
+    schedule_prefixes_single = set()  # Only actual single-letter prefixes (B, U)
     for t in schedule_type_set:
         m = re.match(r'^([A-Z]+)', t)
         if m:
-            schedule_prefixes.add(m.group(1))
+            full_prefix = m.group(1)
+            schedule_prefixes.add(full_prefix)
+            if len(full_prefix) == 1:
+                schedule_prefixes_single.add(full_prefix)
 
     # --- Self-bootstrapping anchor approach ---
-    # Step A: Find anchor types and build prefix sets.
-    # Any code with max_page >= _MIN_FREQ_NEW_PREFIX becomes an anchor.
-    # Room numbers are filtered separately by pattern and page-spread heuristics.
     anchor_prefixes = set(schedule_prefixes)
     for code in code_total:
         max_page = code_max_page.get(code, 0)
@@ -627,27 +857,26 @@ def _find_fixture_codes_in_words(
         total = code_total[code]
         page_spread = code_page_spread.get(code, 0)
 
-        # Room/unit number filter:
-        # 4+ digits with single-letter prefix = almost always room/apt numbers (A2603, A4001)
-        if (len(prefix) == 1 and re.match(r'^[A-Z]\d{4,}', upper)
-                and prefix not in schedule_prefixes):
-            logger.debug("  Floor plan: dropping %s (likely room number: 1-letter + 4+ digits)", code)
-            continue
-        # 3 digits with single-letter prefix, no letter suffix = likely room number (A111, A302)
-        # unless high per-page frequency (L500 appears many times on lighting plans)
-        if (len(prefix) == 1 and re.match(r'^[A-Z]\d{3}$', upper)
-                and max_page < _MIN_FREQ_NEW_PREFIX
-                and prefix not in schedule_prefixes):
-            logger.debug("  Floor plan: dropping %s (likely room number: 1-letter + 3 digits, max_page=%d)",
-                         code, max_page)
+        # Room/unit number filter (single-letter prefix):
+        # Use schedule_prefixes_single for single-letter checks — prevents
+        # AL1's "A" prefix from exempting apartment numbers.
+        if len(prefix) == 1 and schedule_prefixes_single and prefix not in schedule_prefixes_single:
+            # Reject single-letter prefixes not in text schedule — ONLY when
+            # a text schedule exists. This prevents apartment types (A1-A8)
+            # from passing through. When there's no text schedule (all rasterized),
+            # fall through to frequency-based filtering.
+            logger.debug("  Floor plan: dropping %s (single-letter prefix %s not in text schedule)", code, prefix)
             continue
 
-        # Room number heuristic: single-letter prefix codes that appear
-        # across many pages but few times per page are likely room/unit numbers
-        if len(prefix) == 1 and page_spread >= 3 and max_page <= 2:
-            if prefix not in schedule_prefixes:
-                logger.debug("  Floor plan: dropping %s (likely room number: spread=%d, max_page=%d)",
-                             code, page_spread, max_page)
+        if len(prefix) == 1 and prefix in schedule_prefixes_single:
+            # Single-letter prefix IS in schedule — apply targeted filters
+            # 4+ digits = room/apt numbers
+            if re.match(r'^[A-Z]\d{4,}', upper):
+                logger.debug("  Floor plan: dropping %s (room number: 4+ digits)", code)
+                continue
+            # 3 digits = room/apt (but L500 with 10+ per page is OK)
+            if re.match(r'^[A-Z]\d{3}[A-Z]?$', upper) and max_page < 10:
+                logger.debug("  Floor plan: dropping %s (room number: 3 digits, max_page=%d)", code, max_page)
                 continue
 
         if prefix in schedule_prefixes:
@@ -659,8 +888,9 @@ def _find_fixture_codes_in_words(
         elif prefix in anchor_prefixes and len(prefix) >= 2 and total >= 1:
             # 2-letter+ anchor match: accept even single occurrence
             candidates.append(code)
-        elif prefix in anchor_prefixes and total >= 2:
-            # 1-letter anchor match: need at least 2 total occurrences
+        elif prefix in anchor_prefixes and len(prefix) == 1 and total >= 2 and max_page >= 2:
+            # 1-letter anchor: need 2+ total AND 2+ on at least one page
+            # (real fixture types repeat on single pages; room numbers don't)
             candidates.append(code)
         else:
             logger.debug("  Floor plan: dropping %s (total=%d, max_page=%d, prefix=%s)",
@@ -717,25 +947,38 @@ def _merge_type_sources(
     """Merge schedule types (high confidence) with floor plan types.
 
     Schedule types come first; floor plan types are appended if not already present.
-    Deduplication is case-insensitive.
+    Deduplication uses separator-normalized keys (D1A EM = D1A-EM).
     """
     seen = set()
     result = []
     for t in schedule_types:
         upper = t.upper()
-        if upper not in seen:
+        dedup = _dedup_key(upper)
+        if dedup not in seen:
+            seen.add(dedup)
             seen.add(upper)
             result.append(t)
     for t in sorted(floor_plan_types):
         upper = t.upper()
-        if upper not in seen:
+        dedup = _dedup_key(upper)
+        if dedup not in seen:
             # Also check normalized form to avoid DF01 + DF1 duplicates
             norm = _normalize_type_code(upper)
-            if norm not in seen:
+            norm_dedup = _dedup_key(norm)
+            if norm_dedup not in seen:
+                seen.add(dedup)
+                seen.add(norm_dedup)
                 seen.add(upper)
-                seen.add(norm)
                 result.append(t)
     return result
+
+
+def _dedup_key(code: str) -> str:
+    """Create a dedup key by removing dashes, spaces, underscores, quotes.
+
+    Preserves dots and slashes (they carry meaning).
+    """
+    return ''.join(ch for ch in code if ch not in ('-', ' ', '_', '"', "'", '`')).upper()
 
 
 def _direct_counting(
