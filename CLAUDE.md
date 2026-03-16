@@ -91,6 +91,11 @@ tests/
   test_e2e_validation.py   # E2E comparison against expected Excel counts
 docs/
   plans/                   # Design and implementation plans
+  results/                 # Experiment results and learnings (READ BEFORE CHANGING TYPE DISCOVERY)
+    2026-03-16-fixture-type-discovery-results.md  # Comprehensive results from 5 approaches tested
+  superpowers/plans/       # Implementation plans for approaches A and B
+  superpowers/specs/       # Design specs for approaches A and B
+  fixture-type-verification.md  # Verification process, ground truth, and baseline results
   pdf-encoding-analysis.md # PDF encoding analysis across 3 samples
   popeyes-counts-derivation.md
   how-counts-are-derived.md
@@ -125,10 +130,27 @@ See `docs/fixture-type-verification.md` for the full process. Summary:
 - **Metrics**: Recall (did we find all expected types?) and Precision (did we avoid false positives?). Both must be 100% target, and neither may regress from the recorded baseline.
 - **Key rule**: If the ground-truth CSV shows a type with a non-zero quantity, the API must return that type. Types with zero or empty quantity are also expected but lower priority.
 
+## Fixture Type Discovery — Key Learnings (READ FIRST)
+
+**Before changing any fixture type extraction code**, read `docs/results/2026-03-16-fixture-type-discovery-results.md`. It documents 5 approaches tried and why each succeeded or failed.
+
+### Critical Facts
+- Both test PDFs have **rasterized fixture schedule pages** (embedded images, not extractable text). This is the #1 blocker to 95%+ accuracy.
+- **Gemini 2.5 Flash** is the best available vision model — it doesn't hallucinate cross-project types. Currently runs 3× per rasterized page (multi-run union).
+- **GPT-4.1 is unusable for schedule OCR** — it hallucinates fixture types from other projects in its training data.
+- **GPT-4.1 is unusable for floor plan scanning** — it can't distinguish fixture labels from room/office numbers.
+- **pdfplumber is best for floor plans** (text-extractable pages) — deterministic, pattern-matchable. Vision fails on floor plans.
+- **Apartment number filtering** is critical for AMLI BREA (residential project). Single-letter prefix isolation (`schedule_prefixes_single`) prevents apartment codes from polluting results.
+- A **valid Anthropic API key** (Claude Sonnet) or **Gemini 2.5 Pro** would likely break through the accuracy ceiling.
+
+### Current Baseline
+| Dataset | Recall | Precision |
+|---------|--------|-----------|
+| Chase Bank | 70% | 87.5% |
+| AMLI BREA | 73.9% | 64.1% |
+
 ## Technical Notes
 - Only Bluebeam-exported PDFs are supported in v1 (direct AutoCAD exports have SHX vector strokes, not extractable text)
 - pdfplumber finds ~2.5x more fixture labels than PyMuPDF due to better CID/Identity-H handling
-- LLM is verification only — never the sole source of truth
-- Rasterized fixture schedules are rejected (not OCR'd) with a clear error message
+- Rasterized fixture schedules are now handled via multi-run Gemini vision (3× per page)
 - Classifier threshold set to 2000 avg chars to correctly reject Popeyes (has title block text but no fixture labels)
-- Schedule parser currently extracts ~440 candidates from AMLI (noisy) — needs refinement
