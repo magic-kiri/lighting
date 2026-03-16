@@ -30,6 +30,21 @@ def llm_vision_query(system: str, prompt: str, image_bytes: bytes, image_media_t
         raise ValueError(f"Unknown VISION_PROVIDER: {provider}")
 
 
+def llm_vision_query_pro(system: str, prompt: str, image_bytes: bytes, image_media_type: str = "image/png") -> str:
+    """Send a vision query to Gemini 2.5 Pro (higher quality OCR for schedules)."""
+    return _google_vision_pro(system, prompt, image_bytes, image_media_type)
+
+
+def _google_vision_pro(system: str, prompt: str, image_bytes: bytes, image_media_type: str) -> str:
+    import google.generativeai as genai
+    from app.config import GOOGLE_PRO_MODEL
+    genai.configure(api_key=GOOGLE_API_KEY)
+    model = genai.GenerativeModel(GOOGLE_PRO_MODEL, system_instruction=system)
+    image_part = {"mime_type": image_media_type, "data": image_bytes}
+    resp = model.generate_content([image_part, prompt])
+    return resp.text
+
+
 def _anthropic_text(system: str, prompt: str) -> str:
     import anthropic
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)

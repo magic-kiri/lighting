@@ -176,55 +176,85 @@ def _openai_vision_query(system: str, prompt: str, image_bytes: bytes) -> str:
 
 
 def _extract_types_with_vision(pdf_path: str, page_index: int, use_dual_model: bool = False) -> list[str]:
-    """Run Gemini vision 3 times on a rasterized schedule page, union results.
+    """Extract fixture types from rasterized schedule page using multi-model vision.
 
-    Multiple independent runs catch different types due to model non-determinism.
-    Gemini is preferred over GPT-4.1 because it doesn't hallucinate cross-project types.
-    The union maximizes recall. Types in 2+ runs are high confidence.
+    Strategy:
+    1. Gemini 2.5 Pro × 3 runs (best OCR, no cross-project hallucination)
+    2. GPT-4.1 × 1 run (catches types Gemini misses)
+    3. GPT types only kept if corroborated by at least 1 Gemini run.
+       This gives GPT's recall advantage without its hallucination problem.
     """
     from collections import Counter
+    from app.utils.llm_client import llm_vision_query_pro
 
     image_bytes = render_page_to_image(pdf_path, page_index, dpi=200)
     logger.info("  Rendering page %d: %.1f KB at 200 DPI", page_index, len(image_bytes) / 1024)
 
-    N_RUNS = 3
+    # --- Gemini 2.5 Pro × 3 runs ---
+    gemini_union: set[str] = set()
     type_run_count: Counter = Counter()
     norm_to_raw: dict[str, str] = {}
 
-    for run in range(1, N_RUNS + 1):
+    for run in range(1, 4):
         try:
-            response = llm_vision_query(
+            response = llm_vision_query_pro(
                 _VISION_OCR_SYSTEM, _VISION_EXTRACT_PROMPT, image_bytes
             )
             run_types = _parse_fixture_types_response(response)
             run_types = [_clean_type_code(t) for t in run_types]
 
-            # Cap per-run: if a single run returns 60+ types, it's hallucinating
             if len(run_types) > 60:
-                logger.warning("  Run %d/%d: %d types — DISCARDED (exceeds cap)", run, N_RUNS, len(run_types))
+                logger.warning("  Gemini Pro run %d: %d types — DISCARDED (hallucination)", run, len(run_types))
                 continue
 
-            logger.info("  Run %d/%d: %d types", run, N_RUNS, len(run_types))
+            logger.info("  Gemini Pro run %d: %d types", run, len(run_types))
 
             seen_this_run = set()
             for t in run_types:
                 norm = _dedup_normalize(t.strip().upper())
                 if norm and norm not in seen_this_run:
                     seen_this_run.add(norm)
+                    gemini_union.add(norm)
                     type_run_count[norm] += 1
                     if norm not in norm_to_raw:
                         norm_to_raw[norm] = t.strip()
 
         except Exception as e:
-            logger.warning("  Run %d/%d failed: %s", run, N_RUNS, str(e)[:100])
+            logger.warning("  Gemini Pro run %d failed: %s", run, str(e)[:100])
 
-    high = {n for n, c in type_run_count.items() if c >= 2}
-    low = {n for n, c in type_run_count.items() if c == 1}
-    logger.info("  Multi-run results: %d in 2+ runs, %d in 1 run only", len(high), len(low))
+    logger.info("  Gemini Pro union: %d unique types from 3 runs", len(gemini_union))
+
+    # --- GPT-4.1 × 1 run (corroborated only) ---
+    if OPENAI_API_KEY:
+        try:
+            response = _openai_vision_query(
+                _VISION_OCR_SYSTEM, _VISION_EXTRACT_PROMPT, image_bytes
+            )
+            gpt_types = _parse_fixture_types_response(response)
+            gpt_types = [_clean_type_code(t) for t in gpt_types]
+            logger.info("  GPT-4.1: %d types", len(gpt_types))
+
+            gpt_added = 0
+            for t in gpt_types:
+                norm = _dedup_normalize(t.strip().upper())
+                if not norm:
+                    continue
+                if norm in gemini_union:
+                    # Corroborated — boost confidence
+                    type_run_count[norm] += 1
+                else:
+                    logger.debug("  GPT-only DISCARDED: %s (not in any Gemini run)", t)
+
+        except Exception as e:
+            logger.warning("  GPT-4.1 failed: %s", str(e)[:100])
+
+    high = sum(1 for c in type_run_count.values() if c >= 2)
+    logger.info("  Final: %d types (%d in 2+ runs)", len(gemini_union), high)
 
     result = []
     for norm in sorted(type_run_count, key=lambda n: (-type_run_count[n], n)):
-        result.append(norm_to_raw[norm])
+        if norm in gemini_union:
+            result.append(norm_to_raw[norm])
 
     return result
 
