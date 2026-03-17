@@ -113,17 +113,16 @@ def parse_fixture_schedule(pdf_path: str, page_indices: list[int], use_dual_mode
             from app.config import GOOGLE_API_KEY
             t1 = time.time()
             ocr_text = _cloud_vision_ocr(
-                render_page_to_image(pdf_path, idx, dpi=300), GOOGLE_API_KEY
+                render_page_to_image(pdf_path, idx, dpi=200), GOOGLE_API_KEY
             )
             if len(ocr_text) >= SCHEDULE_TEXT_THRESHOLD:
-                # Cloud Vision succeeded — treat as text-extractable (high confidence)
-                logger.info("  Page %d: rasterized → Cloud Vision OCR: %d chars (treating as text)", idx, len(ocr_text))
-                types = extract_fixture_types_llm(ocr_text)
-                logger.info("  Page %d: LLM returned %d types in %.1fs", idx, len(types), time.time() - t1)
+                # Cloud Vision succeeded — extract types from OCR text
+                logger.info("  Page %d: Cloud Vision OCR: %d chars", idx, len(ocr_text))
+                # Split long OCR text into chunks for better LLM extraction
+                # (LLM misses types in very long text — 36K+ chars)
+                types = _extract_types_from_long_text(ocr_text)
+                logger.info("  Page %d: extracted %d types in %.1fs", idx, len(types), time.time() - t1)
                 all_types.extend(types)
-                regex_types = _extract_types_from_schedule_text(ocr_text)
-                logger.info("  Page %d: regex found %d additional types", idx, len(regex_types))
-                all_types.extend(regex_types)
             else:
                 # Cloud Vision failed or empty page — fallback to vision LLM
                 logger.info("  Page %d: Cloud Vision returned %d chars, falling back to vision LLM", idx, len(ocr_text))
@@ -234,6 +233,41 @@ def _extract_types_with_vision(pdf_path: str, page_index: int, use_dual_model: b
 
     logger.info("  Schedule page %d: %d unique types (Cloud Vision OCR + LLM + regex)", page_index, len(result))
     return result
+
+
+def _extract_types_from_long_text(ocr_text: str) -> list[str]:
+    """Extract fixture types from long OCR text by chunking + LLM + regex.
+
+    Long OCR text (36K+ chars) causes LLMs to miss types. Solution:
+    split into overlapping chunks, extract from each, union results.
+    Also run comprehensive regex extraction on the full text.
+    """
+    all_types = []
+
+    # 1. Chunked LLM extraction (5000 char chunks with 500 char overlap)
+    chunk_size = 5000
+    overlap = 500
+    chunks = []
+    for i in range(0, len(ocr_text), chunk_size - overlap):
+        chunk = ocr_text[i:i + chunk_size]
+        if len(chunk) > 200:  # Skip tiny trailing chunks
+            chunks.append(chunk)
+
+    logger.info("  Splitting %d chars into %d chunks for LLM extraction", len(ocr_text), len(chunks))
+    for i, chunk in enumerate(chunks):
+        try:
+            types = extract_fixture_types_llm(chunk)
+            logger.info("  Chunk %d/%d: %d types", i + 1, len(chunks), len(types))
+            all_types.extend(types)
+        except Exception as e:
+            logger.warning("  Chunk %d/%d failed: %s", i + 1, len(chunks), str(e)[:100])
+
+    # 2. Regex extraction on full text (deterministic, catches what LLM misses)
+    regex_types = _extract_types_from_schedule_text(ocr_text)
+    logger.info("  Regex extraction: %d types from full text", len(regex_types))
+    all_types.extend(regex_types)
+
+    return all_types
 
 
 def _cloud_vision_ocr(image_bytes: bytes, api_key: str) -> str:
