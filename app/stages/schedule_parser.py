@@ -176,59 +176,88 @@ def _openai_vision_query(system: str, prompt: str, image_bytes: bytes) -> str:
 
 
 def _extract_types_with_vision(pdf_path: str, page_index: int, use_dual_model: bool = False) -> list[str]:
-    """Extract fixture types from rasterized schedule page using multi-model vision.
+    """Extract fixture types from rasterized schedule page using high-DPI sectioned vision.
 
     Strategy:
-    1. Gemini 2.5 Pro × 3 runs (best OCR, no cross-project hallucination)
-    2. GPT-4.1 × 1 run (catches types Gemini misses)
-    3. GPT types only kept if corroborated by at least 1 Gemini run.
-       This gives GPT's recall advantage without its hallucination problem.
+    1. Render at 400 DPI for maximum text clarity
+    2. Full-page pass with Gemini Pro (catches overall structure)
+    3. 6 overlapping section crops (the model sees 4× larger text per crop)
+    4. Each section sent to Gemini Pro independently
+    5. GPT-4.1 full-page pass, only corroborated types kept
+    6. Union all results, deduplicate
     """
+    import io
     from collections import Counter
+    from PIL import Image
+    Image.MAX_IMAGE_PIXELS = 300_000_000  # Allow large engineering drawings
     from app.utils.llm_client import llm_vision_query_pro
 
-    image_bytes = render_page_to_image(pdf_path, page_index, dpi=200)
-    logger.info("  Rendering page %d: %.1f KB at 200 DPI", page_index, len(image_bytes) / 1024)
+    # Render at HIGH DPI for better text resolution on sections
+    image_bytes_hi = render_page_to_image(pdf_path, page_index, dpi=300)
+    image_bytes_lo = render_page_to_image(pdf_path, page_index, dpi=200)
+    logger.info("  Rendering page %d: %.1f KB at 300 DPI, %.1f KB at 200 DPI",
+                page_index, len(image_bytes_hi) / 1024, len(image_bytes_lo) / 1024)
 
-    # --- Gemini 2.5 Pro × 3 runs ---
+    img = Image.open(io.BytesIO(image_bytes_hi))
+    w, h = img.size
+
     gemini_union: set[str] = set()
     type_run_count: Counter = Counter()
     norm_to_raw: dict[str, str] = {}
 
-    for run in range(1, 4):
+    def _add_types(types: list[str], label: str):
+        """Add types from a vision pass to the union."""
+        cleaned = [_clean_type_code(t) for t in types]
+        if len(cleaned) > 80:
+            logger.warning("  %s: %d types — DISCARDED (hallucination)", label, len(cleaned))
+            return
+        logger.info("  %s: %d types", label, len(cleaned))
+        seen = set()
+        for t in cleaned:
+            norm = _dedup_normalize(t.strip().upper())
+            if norm and norm not in seen:
+                seen.add(norm)
+                gemini_union.add(norm)
+                type_run_count[norm] += 1
+                if norm not in norm_to_raw:
+                    norm_to_raw[norm] = t.strip()
+
+    # --- Pass 1: Gemini Pro full page at 200 DPI (overview) ---
+    try:
+        resp = llm_vision_query_pro(_VISION_OCR_SYSTEM, _VISION_EXTRACT_PROMPT, image_bytes_lo)
+        _add_types(_parse_fixture_types_response(resp), "Gemini Pro full-page")
+    except Exception as e:
+        logger.warning("  Gemini Pro full-page failed: %s", str(e)[:100])
+
+    # --- Pass 2: Gemini Pro 6 overlapping sections at 400 DPI ---
+    # 2 columns × 3 rows with overlap — each section is ~1/4 of the page
+    # At 300 DPI, each section has ~2.25× text resolution vs 200 DPI full-page
+    sections = [
+        ("top-left",     0.0,  0.0,  0.55, 0.40),
+        ("top-right",    0.45, 0.0,  1.0,  0.40),
+        ("mid-left",     0.0,  0.25, 0.55, 0.65),
+        ("mid-right",    0.45, 0.25, 1.0,  0.65),
+        ("bot-left",     0.0,  0.55, 0.55, 1.0),
+        ("bot-right",    0.45, 0.55, 1.0,  1.0),
+    ]
+
+    for name, x1f, y1f, x2f, y2f in sections:
         try:
-            response = llm_vision_query_pro(
-                _VISION_OCR_SYSTEM, _VISION_EXTRACT_PROMPT, image_bytes
-            )
-            run_types = _parse_fixture_types_response(response)
-            run_types = [_clean_type_code(t) for t in run_types]
-
-            if len(run_types) > 60:
-                logger.warning("  Gemini Pro run %d: %d types — DISCARDED (hallucination)", run, len(run_types))
-                continue
-
-            logger.info("  Gemini Pro run %d: %d types", run, len(run_types))
-
-            seen_this_run = set()
-            for t in run_types:
-                norm = _dedup_normalize(t.strip().upper())
-                if norm and norm not in seen_this_run:
-                    seen_this_run.add(norm)
-                    gemini_union.add(norm)
-                    type_run_count[norm] += 1
-                    if norm not in norm_to_raw:
-                        norm_to_raw[norm] = t.strip()
-
+            crop = img.crop((int(w * x1f), int(h * y1f), int(w * x2f), int(h * y2f)))
+            buf = io.BytesIO()
+            crop.save(buf, format="PNG")
+            resp = llm_vision_query_pro(_VISION_OCR_SYSTEM, _VISION_EXTRACT_PROMPT, buf.getvalue())
+            _add_types(_parse_fixture_types_response(resp), f"Gemini Pro {name}")
         except Exception as e:
-            logger.warning("  Gemini Pro run %d failed: %s", run, str(e)[:100])
+            logger.warning("  Gemini Pro %s failed: %s", name, str(e)[:100])
 
-    logger.info("  Gemini Pro union: %d unique types from 3 runs", len(gemini_union))
+    logger.info("  Gemini Pro total: %d unique types from 7 passes", len(gemini_union))
 
-    # --- GPT-4.1 × 1 run (corroborated only) ---
+    # --- Pass 3: GPT-4.1 full page at 200 DPI (corroborated only) ---
     if OPENAI_API_KEY:
         try:
             response = _openai_vision_query(
-                _VISION_OCR_SYSTEM, _VISION_EXTRACT_PROMPT, image_bytes
+                _VISION_OCR_SYSTEM, _VISION_EXTRACT_PROMPT, image_bytes_lo
             )
             gpt_types = _parse_fixture_types_response(response)
             gpt_types = [_clean_type_code(t) for t in gpt_types]
