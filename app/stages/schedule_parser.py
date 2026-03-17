@@ -12,16 +12,27 @@ _EXTRACT_TYPES_SYSTEM = (
     "You are an expert at reading lighting fixture schedules from engineering drawings."
 )
 
-_EXTRACT_TYPES_PROMPT = """Below is text extracted from a lighting fixture schedule in an engineering drawing PDF.
-Extract ALL unique fixture type codes from this schedule.
+_EXTRACT_TYPES_PROMPT = """Below is text from a lighting fixture schedule in an engineering drawing PDF.
+Extract ALL unique fixture TYPE CODES from this text.
 
-Rules:
-- Type codes are short identifiers like D1A, L-22, DF01, SS9, BX(S), LT-104.1
-- Include EM (emergency) variants as separate types (e.g., D1A-EM, LP1 EM)
-- Include compound types (e.g., AS1/AS2, SC1/SC3)
-- Include size variants that are part of the code (e.g., B1.8', B1.12')
-- Do NOT include descriptions, manufacturers, wattages, or catalog numbers
-- Do NOT invent types that are not in the text
+WHAT ARE FIXTURE TYPE CODES:
+- Short identifiers that name a lighting fixture type: D1A, L-22, DF01, SS9, LT-104.1, BX(S), PH3-POLE
+- They appear at the START of each fixture entry in the schedule
+- They have 1-2 letter prefix + optional separator + digits: B1, GA1, DF4, LP2, RD6A, LT-108
+- Include EM (emergency) variants: D1A-EM, LP1 EM, L500-EM, L8EM, LR3 EM
+- Include compound types with slash: AS1/AS2, SC1/SC3
+- Include size-embedded codes: B1.8', B1.12'
+- Include parenthesized codes: BX(S), BX(D)
+- Include special variants: PH3-POLE
+- Letter-only codes (2-3 letters, no digits) are valid if they name a fixture: GA, XA, XK
+
+WHAT ARE NOT FIXTURE TYPE CODES (exclude these):
+- Room/apartment names: A2, A3, C4, C5, Suite 100, Level 1
+- Catalog/part numbers: CLX-L48-4000LM,?"4-12-WH-35, F3RS-1-F
+- Manufacturer abbreviations: LUM, AME, GE, LIT, DIO
+- Wattage/electrical values: 120V, 277V, 40W, 3000K
+- Ratings: IP67, IP20, UL, ETL, CSA
+- Drawing references: E0.04, A-301, M-501
 
 Return ONLY valid JSON: {{"fixture_types": ["TYPE1", "TYPE2", ...]}}
 
@@ -70,9 +81,6 @@ EXCLUDE_WORDS = {
 # MP = Mechanical Panel, HP = HVAC Panel, EP = Electrical Panel, PP = Power Panel
 _PANEL_PREFIXES = {"MP", "HP", "EP", "PP", "EV"}
 
-# Specification values that look like fixture codes but aren't
-_SPEC_CODES = {"IP67", "IP65", "IP20", "IP44", "GZ10", "GZ4", "GU10", "GU24",
-               "T5", "T8", "E26", "E12", "G24", "G5", "G9"}
 
 
 def parse_fixture_schedule(pdf_path: str, page_indices: list[int], use_dual_model: bool = False) -> dict:
@@ -99,15 +107,12 @@ def parse_fixture_schedule(pdf_path: str, page_indices: list[int], use_dual_mode
     for idx in page_indices:
         text = page_texts.get(idx, "")
         if len(text) >= SCHEDULE_TEXT_THRESHOLD:
-            # Text-extractable: LLM extraction + regex extraction
-            logger.info("  Page %d: %d chars — text-extractable, using LLM + regex", idx, len(text))
+            # Text-extractable: chunked LLM extraction
+            logger.info("  Page %d: %d chars — text-extractable", idx, len(text))
             t1 = time.time()
-            types = extract_fixture_types_llm(text)
-            logger.info("  Page %d: LLM returned %d types in %.1fs", idx, len(types), time.time() - t1)
+            types = _extract_types_from_long_text(text)
+            logger.info("  Page %d: %d types in %.1fs", idx, len(types), time.time() - t1)
             all_types.extend(types)
-            regex_types = _extract_types_from_schedule_text(text)
-            logger.info("  Page %d: regex found %d additional types", idx, len(regex_types))
-            all_types.extend(regex_types)
         else:
             # Rasterized: try Cloud Vision OCR first (produces text like pdfplumber)
             from app.config import GOOGLE_API_KEY
@@ -124,11 +129,19 @@ def parse_fixture_schedule(pdf_path: str, page_indices: list[int], use_dual_mode
                 logger.info("  Page %d: extracted %d types in %.1fs", idx, len(types), time.time() - t1)
                 all_types.extend(types)
             else:
-                # Cloud Vision failed or empty page — fallback to vision LLM
-                logger.info("  Page %d: Cloud Vision returned %d chars, falling back to vision LLM", idx, len(ocr_text))
-                types = _extract_types_with_vision(pdf_path, idx, use_dual_model=use_dual_model)
-                logger.info("  Page %d: vision returned %d types in %.1fs", idx, len(types), time.time() - t1)
-                all_types.extend(types)
+                # Cloud Vision failed or empty page — fallback to Gemini vision
+                logger.info("  Page %d: Cloud Vision returned %d chars, falling back to Gemini", idx, len(ocr_text))
+                try:
+                    img_bytes = render_page_to_image(pdf_path, idx, dpi=200)
+                    response = llm_vision_query(
+                        _VISION_OCR_SYSTEM, _VISION_EXTRACT_PROMPT, img_bytes
+                    )
+                    types = _parse_fixture_types_response(response)
+                    types = [_clean_type_code(t) for t in types]
+                    logger.info("  Page %d: Gemini returned %d types in %.1fs", idx, len(types), time.time() - t1)
+                    all_types.extend(types)
+                except Exception as e:
+                    logger.warning("  Page %d: Gemini fallback failed: %s", idx, str(e)[:100])
 
     # Clean up and deduplicate (with separator-normalized dedup)
     all_types = [_clean_type_code(t) for t in all_types]
@@ -136,7 +149,7 @@ def parse_fixture_schedule(pdf_path: str, page_indices: list[int], use_dual_mode
     fixture_types = []
     for t in all_types:
         t_upper = t.strip().upper()
-        if not t_upper or t_upper in EXCLUDE_WORDS or t_upper in _SPEC_CODES:
+        if not t_upper or t_upper in EXCLUDE_WORDS:
             continue
         # Normalize separators for dedup: "D1A EM" and "D1A-EM" → "D1AEM"
         norm_key = _dedup_normalize(t_upper)
@@ -188,69 +201,24 @@ def _openai_vision_query(system: str, prompt: str, image_bytes: bytes) -> str:
     return resp.choices[0].message.content
 
 
-def _extract_types_with_vision(pdf_path: str, page_index: int, use_dual_model: bool = False) -> list[str]:
-    """Extract fixture types from rasterized schedule page.
-
-    Strategy: Google Cloud Vision OCR (dedicated document OCR) extracts raw text,
-    then LLM parses fixture type codes from the OCR text. This is far more accurate
-    than vision LLM directly reading images — Cloud Vision reads text at pixel level.
-    Falls back to Gemini Pro vision if Cloud Vision is unavailable.
-    """
-    from collections import Counter
-    from app.config import GOOGLE_API_KEY
-
-    image_bytes = render_page_to_image(pdf_path, page_index, dpi=300)
-    logger.info("  Rendering page %d: %.1f KB at 300 DPI", page_index, len(image_bytes) / 1024)
-
-    # --- Step 1: Google Cloud Vision OCR → raw text ---
-    ocr_text = _cloud_vision_ocr(image_bytes, GOOGLE_API_KEY)
-
-    if len(ocr_text) < 200:
-        logger.warning("  Cloud Vision returned only %d chars, falling back to Gemini Pro", len(ocr_text))
-        return _extract_types_with_gemini_pro(pdf_path, page_index)
-
-    logger.info("  Cloud Vision OCR: %d chars extracted", len(ocr_text))
-
-    # --- Step 2: LLM extracts fixture types from OCR text ---
-    llm_types = extract_fixture_types_llm(ocr_text)
-    logger.info("  LLM extracted %d types from OCR text", len(llm_types))
-
-    # --- Step 3: Regex extraction from OCR text (deterministic supplement) ---
-    regex_types = _extract_types_from_schedule_text(ocr_text)
-    logger.info("  Regex extracted %d types from OCR text", len(regex_types))
-
-    # --- Merge and dedup ---
-    all_types = llm_types + regex_types
-    all_types = [_clean_type_code(t) for t in all_types]
-
-    seen = set()
-    result = []
-    for t in all_types:
-        norm = _dedup_normalize(t.strip().upper())
-        if norm and norm not in seen:
-            seen.add(norm)
-            result.append(t.strip())
-
-    logger.info("  Schedule page %d: %d unique types (Cloud Vision OCR + LLM + regex)", page_index, len(result))
-    return result
 
 
 def _extract_types_from_long_text(ocr_text: str) -> list[str]:
-    """Extract fixture types from long OCR text by chunking + LLM + regex.
+    """Extract fixture types from long OCR text by chunking + LLM.
 
     Long OCR text (36K+ chars) causes LLMs to miss types. Solution:
-    split into overlapping chunks, extract from each, union results.
-    Also run comprehensive regex extraction on the full text.
+    split into overlapping chunks, extract from each chunk independently,
+    union all results. Purely LLM-based — no regex overfitting.
     """
     all_types = []
 
-    # 1. Chunked LLM extraction (5000 char chunks with 500 char overlap)
-    chunk_size = 5000
+    # Chunked LLM extraction (4000 char chunks with 500 char overlap)
+    chunk_size = 4000
     overlap = 500
     chunks = []
     for i in range(0, len(ocr_text), chunk_size - overlap):
         chunk = ocr_text[i:i + chunk_size]
-        if len(chunk) > 200:  # Skip tiny trailing chunks
+        if len(chunk) > 200:
             chunks.append(chunk)
 
     logger.info("  Splitting %d chars into %d chunks for LLM extraction", len(ocr_text), len(chunks))
@@ -261,11 +229,6 @@ def _extract_types_from_long_text(ocr_text: str) -> list[str]:
             all_types.extend(types)
         except Exception as e:
             logger.warning("  Chunk %d/%d failed: %s", i + 1, len(chunks), str(e)[:100])
-
-    # 2. Regex extraction on full text (deterministic, catches what LLM misses)
-    regex_types = _extract_types_from_schedule_text(ocr_text)
-    logger.info("  Regex extraction: %d types from full text", len(regex_types))
-    all_types.extend(regex_types)
 
     return all_types
 
@@ -300,90 +263,6 @@ def _cloud_vision_ocr(image_bytes: bytes, api_key: str) -> str:
     return ""
 
 
-def _extract_types_with_gemini_pro(pdf_path: str, page_index: int) -> list[str]:
-    """Fallback: Gemini Pro vision when Cloud Vision is unavailable."""
-    from app.utils.llm_client import llm_vision_query_pro
-
-    image_bytes = render_page_to_image(pdf_path, page_index, dpi=200)
-    try:
-        resp = llm_vision_query_pro(_VISION_OCR_SYSTEM, _VISION_EXTRACT_PROMPT, image_bytes)
-        types = _parse_fixture_types_response(resp)
-        return [_clean_type_code(t) for t in types if len(types) <= 60]
-    except Exception as e:
-        logger.warning("  Gemini Pro fallback failed: %s", str(e)[:100])
-        return []
-
-
-
-
-def _extract_types_from_schedule_text(text: str) -> list[str]:
-    """Extract fixture type codes from schedule text using regex patterns.
-
-    Looks for fixture codes at the start of lines or before catalog numbers (#).
-    This is a deterministic supplement to LLM extraction.
-
-    In engineering fixture schedules, type codes appear as:
-      B1 #CLX-L48-4000LM-...  → B1
-      GA1 #VCPG LED-V4-...     → GA1
-      B1-EM #CLX-L48-...       → B1-EM
-      LP1 EM  (description)    → LP1 EM
-      LT-104.1  (description)  → LT-104.1
-    """
-    found = set()
-    # Pattern 1: fixture code before catalog number (#xxx)
-    # e.g., "B1 #CLX-L48-...", "GA #VCPG LED-..."
-    catalog_re = re.compile(
-        r'\b([A-Z]{1,2}[-.]?\d*[A-Z]?(?:\.\d{1,2})?(?:[-\s]?EM)?)\s+#',
-    )
-    for m in catalog_re.finditer(text):
-        code = m.group(1).strip()
-        if len(code) >= 2 and code.upper() not in EXCLUDE_WORDS and code.upper() not in _SPEC_CODES:
-            found.add(code)
-
-    # Pattern 2: fixture code before schedule keywords
-    # e.g., "B2 STEP DIMMING", "U4 DIMMING DRIVER", "B3 FIXED OUTPUT"
-    keyword_re = re.compile(
-        r'\b([A-Z]{1,2}[-.]?\d+[A-Z]?(?:\.\d{1,2})?(?:[-\s]?EM)?)\s+'
-        r'(?:DIMMING|FIXED|STEP|REMOTE|OUTPUT|DRIVER)',
-    )
-    for m in keyword_re.finditer(text):
-        code = m.group(1).strip()
-        if len(code) >= 2 and code.upper() not in EXCLUDE_WORDS:
-            found.add(code)
-
-    # Pattern 3: fixture code at start of line followed by text
-    line_start_re = re.compile(
-        r'(?:^|\n)\s*'
-        r'([A-Z]{1,2}[-.]?\d+[A-Z]?(?:\.\d{1,2})?(?:[-\s]?EM)?)'
-        r'(?:\s+[#(A-Z])',
-        re.MULTILINE
-    )
-    for m in line_start_re.finditer(text):
-        code = m.group(1).strip()
-        if len(code) >= 2 and code.upper() not in EXCLUDE_WORDS:
-            found.add(code)
-
-    # Also look for compound types: AS1/AS2, SC1/SC3
-    compound_re = re.compile(r'\b([A-Z]{1,2}\d+[A-Z]?/[A-Z]{1,2}\d+[A-Z]?)\b')
-    for m in compound_re.finditer(text):
-        found.add(m.group(1))
-
-    # Also look for parenthesized types: BX(S), BX(D)
-    paren_re = re.compile(r'\b([A-Z]{1,2}\([A-Z]+\))\b')
-    for m in paren_re.finditer(text):
-        found.add(m.group(1))
-
-    # Also look for POLE variants: PH3-POLE
-    pole_re = re.compile(r'\b([A-Z]{1,2}\d+[A-Z]?-POLE)\b')
-    for m in pole_re.finditer(text):
-        found.add(m.group(1))
-
-    # Also look for size-embedded types: B1.8', B1.12'
-    size_re = re.compile(r"\b([A-Z]{1,2}\d+\.\d+')['\s]")
-    for m in size_re.finditer(text):
-        found.add(m.group(1))
-
-    return list(found)
 
 
 def _dedup_normalize(code: str) -> str:
