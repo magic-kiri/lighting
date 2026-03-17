@@ -99,23 +99,37 @@ def parse_fixture_schedule(pdf_path: str, page_indices: list[int], use_dual_mode
     for idx in page_indices:
         text = page_texts.get(idx, "")
         if len(text) >= SCHEDULE_TEXT_THRESHOLD:
-            # Text-extractable: LLM extraction + regex extraction (for coverage)
-            logger.info("  Page %d: %d chars — text-extractable, using LLM + regex extraction", idx, len(text))
+            # Text-extractable: LLM extraction + regex extraction
+            logger.info("  Page %d: %d chars — text-extractable, using LLM + regex", idx, len(text))
             t1 = time.time()
             types = extract_fixture_types_llm(text)
             logger.info("  Page %d: LLM returned %d types in %.1fs", idx, len(types), time.time() - t1)
             all_types.extend(types)
-            # Supplement with regex extraction from the raw text
             regex_types = _extract_types_from_schedule_text(text)
             logger.info("  Page %d: regex found %d additional types", idx, len(regex_types))
             all_types.extend(regex_types)
         else:
-            # Rasterized: vision extraction
-            logger.info("  Page %d: %d chars — rasterized, using vision extraction", idx, len(text))
+            # Rasterized: try Cloud Vision OCR first (produces text like pdfplumber)
+            from app.config import GOOGLE_API_KEY
             t1 = time.time()
-            types = _extract_types_with_vision(pdf_path, idx, use_dual_model=use_dual_model)
-            logger.info("  Page %d: vision returned %d types in %.1fs", idx, len(types), time.time() - t1)
-            all_types.extend(types)
+            ocr_text = _cloud_vision_ocr(
+                render_page_to_image(pdf_path, idx, dpi=300), GOOGLE_API_KEY
+            )
+            if len(ocr_text) >= SCHEDULE_TEXT_THRESHOLD:
+                # Cloud Vision succeeded — treat as text-extractable (high confidence)
+                logger.info("  Page %d: rasterized → Cloud Vision OCR: %d chars (treating as text)", idx, len(ocr_text))
+                types = extract_fixture_types_llm(ocr_text)
+                logger.info("  Page %d: LLM returned %d types in %.1fs", idx, len(types), time.time() - t1)
+                all_types.extend(types)
+                regex_types = _extract_types_from_schedule_text(ocr_text)
+                logger.info("  Page %d: regex found %d additional types", idx, len(regex_types))
+                all_types.extend(regex_types)
+            else:
+                # Cloud Vision failed or empty page — fallback to vision LLM
+                logger.info("  Page %d: Cloud Vision returned %d chars, falling back to vision LLM", idx, len(ocr_text))
+                types = _extract_types_with_vision(pdf_path, idx, use_dual_model=use_dual_model)
+                logger.info("  Page %d: vision returned %d types in %.1fs", idx, len(types), time.time() - t1)
+                all_types.extend(types)
 
     # Clean up and deduplicate (with separator-normalized dedup)
     all_types = [_clean_type_code(t) for t in all_types]
@@ -176,116 +190,96 @@ def _openai_vision_query(system: str, prompt: str, image_bytes: bytes) -> str:
 
 
 def _extract_types_with_vision(pdf_path: str, page_index: int, use_dual_model: bool = False) -> list[str]:
-    """Extract fixture types from rasterized schedule page using high-DPI sectioned vision.
+    """Extract fixture types from rasterized schedule page.
 
-    Strategy:
-    1. Render at 400 DPI for maximum text clarity
-    2. Full-page pass with Gemini Pro (catches overall structure)
-    3. 6 overlapping section crops (the model sees 4× larger text per crop)
-    4. Each section sent to Gemini Pro independently
-    5. GPT-4.1 full-page pass, only corroborated types kept
-    6. Union all results, deduplicate
+    Strategy: Google Cloud Vision OCR (dedicated document OCR) extracts raw text,
+    then LLM parses fixture type codes from the OCR text. This is far more accurate
+    than vision LLM directly reading images — Cloud Vision reads text at pixel level.
+    Falls back to Gemini Pro vision if Cloud Vision is unavailable.
     """
-    import io
     from collections import Counter
-    from PIL import Image
-    Image.MAX_IMAGE_PIXELS = 300_000_000  # Allow large engineering drawings
+    from app.config import GOOGLE_API_KEY
+
+    image_bytes = render_page_to_image(pdf_path, page_index, dpi=300)
+    logger.info("  Rendering page %d: %.1f KB at 300 DPI", page_index, len(image_bytes) / 1024)
+
+    # --- Step 1: Google Cloud Vision OCR → raw text ---
+    ocr_text = _cloud_vision_ocr(image_bytes, GOOGLE_API_KEY)
+
+    if len(ocr_text) < 200:
+        logger.warning("  Cloud Vision returned only %d chars, falling back to Gemini Pro", len(ocr_text))
+        return _extract_types_with_gemini_pro(pdf_path, page_index)
+
+    logger.info("  Cloud Vision OCR: %d chars extracted", len(ocr_text))
+
+    # --- Step 2: LLM extracts fixture types from OCR text ---
+    llm_types = extract_fixture_types_llm(ocr_text)
+    logger.info("  LLM extracted %d types from OCR text", len(llm_types))
+
+    # --- Step 3: Regex extraction from OCR text (deterministic supplement) ---
+    regex_types = _extract_types_from_schedule_text(ocr_text)
+    logger.info("  Regex extracted %d types from OCR text", len(regex_types))
+
+    # --- Merge and dedup ---
+    all_types = llm_types + regex_types
+    all_types = [_clean_type_code(t) for t in all_types]
+
+    seen = set()
+    result = []
+    for t in all_types:
+        norm = _dedup_normalize(t.strip().upper())
+        if norm and norm not in seen:
+            seen.add(norm)
+            result.append(t.strip())
+
+    logger.info("  Schedule page %d: %d unique types (Cloud Vision OCR + LLM + regex)", page_index, len(result))
+    return result
+
+
+def _cloud_vision_ocr(image_bytes: bytes, api_key: str) -> str:
+    """Extract text from image using Google Cloud Vision DOCUMENT_TEXT_DETECTION."""
+    import base64
+    import requests
+
+    if not api_key:
+        return ""
+
+    url = f"https://vision.googleapis.com/v1/images:annotate?key={api_key}"
+    b64 = base64.b64encode(image_bytes).decode()
+    payload = {
+        "requests": [{
+            "image": {"content": b64},
+            "features": [{"type": "DOCUMENT_TEXT_DETECTION"}]
+        }]
+    }
+
+    try:
+        resp = requests.post(url, json=payload, timeout=60)
+        if resp.status_code == 200:
+            data = resp.json()
+            if 'responses' in data and data['responses']:
+                return data['responses'][0].get('fullTextAnnotation', {}).get('text', '')
+        logger.warning("  Cloud Vision API error: %d %s", resp.status_code, resp.text[:100])
+    except Exception as e:
+        logger.warning("  Cloud Vision API failed: %s", str(e)[:100])
+
+    return ""
+
+
+def _extract_types_with_gemini_pro(pdf_path: str, page_index: int) -> list[str]:
+    """Fallback: Gemini Pro vision when Cloud Vision is unavailable."""
     from app.utils.llm_client import llm_vision_query_pro
 
-    # Render at HIGH DPI for better text resolution on sections
-    image_bytes_hi = render_page_to_image(pdf_path, page_index, dpi=300)
-    image_bytes_lo = render_page_to_image(pdf_path, page_index, dpi=200)
-    logger.info("  Rendering page %d: %.1f KB at 300 DPI, %.1f KB at 200 DPI",
-                page_index, len(image_bytes_hi) / 1024, len(image_bytes_lo) / 1024)
-
-    img = Image.open(io.BytesIO(image_bytes_hi))
-    w, h = img.size
-
-    gemini_union: set[str] = set()
-    type_run_count: Counter = Counter()
-    norm_to_raw: dict[str, str] = {}
-
-    def _add_types(types: list[str], label: str):
-        """Add types from a vision pass to the union."""
-        cleaned = [_clean_type_code(t) for t in types]
-        if len(cleaned) > 80:
-            logger.warning("  %s: %d types — DISCARDED (hallucination)", label, len(cleaned))
-            return
-        logger.info("  %s: %d types", label, len(cleaned))
-        seen = set()
-        for t in cleaned:
-            norm = _dedup_normalize(t.strip().upper())
-            if norm and norm not in seen:
-                seen.add(norm)
-                gemini_union.add(norm)
-                type_run_count[norm] += 1
-                if norm not in norm_to_raw:
-                    norm_to_raw[norm] = t.strip()
-
-    # --- Pass 1: Gemini Pro full page at 200 DPI (overview) ---
+    image_bytes = render_page_to_image(pdf_path, page_index, dpi=200)
     try:
-        resp = llm_vision_query_pro(_VISION_OCR_SYSTEM, _VISION_EXTRACT_PROMPT, image_bytes_lo)
-        _add_types(_parse_fixture_types_response(resp), "Gemini Pro full-page")
+        resp = llm_vision_query_pro(_VISION_OCR_SYSTEM, _VISION_EXTRACT_PROMPT, image_bytes)
+        types = _parse_fixture_types_response(resp)
+        return [_clean_type_code(t) for t in types if len(types) <= 60]
     except Exception as e:
-        logger.warning("  Gemini Pro full-page failed: %s", str(e)[:100])
+        logger.warning("  Gemini Pro fallback failed: %s", str(e)[:100])
+        return []
 
-    # --- Pass 2: Gemini Pro 6 overlapping sections at 400 DPI ---
-    # 2 columns × 3 rows with overlap — each section is ~1/4 of the page
-    # At 300 DPI, each section has ~2.25× text resolution vs 200 DPI full-page
-    sections = [
-        ("top-left",     0.0,  0.0,  0.55, 0.40),
-        ("top-right",    0.45, 0.0,  1.0,  0.40),
-        ("mid-left",     0.0,  0.25, 0.55, 0.65),
-        ("mid-right",    0.45, 0.25, 1.0,  0.65),
-        ("bot-left",     0.0,  0.55, 0.55, 1.0),
-        ("bot-right",    0.45, 0.55, 1.0,  1.0),
-    ]
 
-    for name, x1f, y1f, x2f, y2f in sections:
-        try:
-            crop = img.crop((int(w * x1f), int(h * y1f), int(w * x2f), int(h * y2f)))
-            buf = io.BytesIO()
-            crop.save(buf, format="PNG")
-            resp = llm_vision_query_pro(_VISION_OCR_SYSTEM, _VISION_EXTRACT_PROMPT, buf.getvalue())
-            _add_types(_parse_fixture_types_response(resp), f"Gemini Pro {name}")
-        except Exception as e:
-            logger.warning("  Gemini Pro %s failed: %s", name, str(e)[:100])
-
-    logger.info("  Gemini Pro total: %d unique types from 7 passes", len(gemini_union))
-
-    # --- Pass 3: GPT-4.1 full page at 200 DPI (corroborated only) ---
-    if OPENAI_API_KEY:
-        try:
-            response = _openai_vision_query(
-                _VISION_OCR_SYSTEM, _VISION_EXTRACT_PROMPT, image_bytes_lo
-            )
-            gpt_types = _parse_fixture_types_response(response)
-            gpt_types = [_clean_type_code(t) for t in gpt_types]
-            logger.info("  GPT-4.1: %d types", len(gpt_types))
-
-            gpt_added = 0
-            for t in gpt_types:
-                norm = _dedup_normalize(t.strip().upper())
-                if not norm:
-                    continue
-                if norm in gemini_union:
-                    # Corroborated — boost confidence
-                    type_run_count[norm] += 1
-                else:
-                    logger.debug("  GPT-only DISCARDED: %s (not in any Gemini run)", t)
-
-        except Exception as e:
-            logger.warning("  GPT-4.1 failed: %s", str(e)[:100])
-
-    high = sum(1 for c in type_run_count.values() if c >= 2)
-    logger.info("  Final: %d types (%d in 2+ runs)", len(gemini_union), high)
-
-    result = []
-    for norm in sorted(type_run_count, key=lambda n: (-type_run_count[n], n)):
-        if norm in gemini_union:
-            result.append(norm_to_raw[norm])
-
-    return result
 
 
 def _extract_types_from_schedule_text(text: str) -> list[str]:

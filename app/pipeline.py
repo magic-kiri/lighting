@@ -235,26 +235,22 @@ def _discover_types(
                 )
                 logger.info("  Schedule (text): %d types", len(text_schedule_types))
 
-        # --- Step 1b: Rasterized schedule pages (vision, needs filtering) ---
-        # Always use dual-model (GPT-4.1 + Gemini) for rasterized pages.
-        # GPT-4.1 hallucinations are filtered downstream by floor plan cross-ref.
-        use_dual = True
+        # --- Step 1b: Rasterized schedule pages ---
+        # Cloud Vision OCR converts rasterized pages to text. The schedule parser
+        # tries Cloud Vision first; if successful, types are HIGH CONFIDENCE (same
+        # as text-extractable). They go into text_schedule_types, NOT vision types.
         if raster_pages:
-            logger.info("  Schedule (vision): parsing %d rasterized pages individually: %s (dual_model=%s)",
-                        len(raster_pages), raster_pages, use_dual)
+            logger.info("  Schedule (rasterized): parsing %d pages with Cloud Vision OCR: %s",
+                        len(raster_pages), raster_pages)
             for rp in raster_pages:
-                result = parse_fixture_schedule(pdf_path, [rp], use_dual_model=use_dual)
+                result = parse_fixture_schedule(pdf_path, [rp])
                 if result["success"]:
                     page_types = _normalize_schedule_output(
                         [ft["type_code"] for ft in result["fixture_types"]]
                     )
-                    vision_types_by_page[rp] = page_types
-                    logger.info("  Schedule (vision) page %d: %d types", rp, len(page_types))
-                else:
-                    vision_types_by_page[rp] = []
-            # Flatten all vision types (deduplicated later)
-            for types in vision_types_by_page.values():
-                raw_vision_types.extend(types)
+                    # Treat Cloud Vision OCR results as text schedule types (high confidence)
+                    text_schedule_types.extend(page_types)
+                    logger.info("  Schedule page %d: %d types (Cloud Vision → text path)", rp, len(page_types))
 
     # --- Step 2: Floor plan word extraction ---
     # Start with detected lighting + unit pages, then add high-density electrical pages
